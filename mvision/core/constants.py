@@ -1,0 +1,2 @@
+APP_NAME = "My FastAPI Project"
+DEFAULT_PAGE_SIZE = 20
