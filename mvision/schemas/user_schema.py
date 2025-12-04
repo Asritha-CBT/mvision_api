@@ -1,20 +1,26 @@
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 
 class UserRegister(BaseModel):
-    name: str = Field(..., min_length=1, max_length=50, description="User's name is required")
-    department: str = Field(..., min_length=1, max_length=50, description="Department is required")
+    name: str = Field(..., min_length=1, max_length=50)
+    department: str = Field(..., min_length=1, max_length=50)
 
-    # Ensure strings are not just spaces
-    @validator('name', 'department')
-    def not_empty(cls, v):
-        if not v.strip():
-            raise ValueError("This field cannot be empty")
-        return v
+    @field_validator('name', 'department')
+    def not_empty(cls, value):
+        if not value.strip():
+            raise ValueError("cannot be empty")
+        return value
+
 
 class UserResponse(BaseModel):
     id: int
     name: str
     department: str
+    embeddings_path: str | None = None
 
     class Config:
-        from_attributes = True   # correct attribute for ORM support
+        from_attributes = True
+
+
+
+class EmbeddingUpdate(BaseModel):
+    embeddings_path: str
