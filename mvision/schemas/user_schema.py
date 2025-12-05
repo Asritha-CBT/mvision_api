@@ -1,4 +1,5 @@
 from pydantic import BaseModel, Field, field_validator
+from typing import List, Optional
 
 class UserRegister(BaseModel):
     name: str = Field(..., min_length=1, max_length=50)
@@ -14,13 +15,12 @@ class UserRegister(BaseModel):
 class UserResponse(BaseModel):
     id: int
     name: str
-    department: str
-    embeddings_path: str | None = None
+    department: Optional[str] = None
+    embedding: Optional[List[float]] = None   # <-- pgvector field
 
     class Config:
         from_attributes = True
 
 
-
 class EmbeddingUpdate(BaseModel):
-    embeddings_path: str
+    embedding: Optional[List[float]] = None
