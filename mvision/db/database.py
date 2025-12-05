@@ -1,11 +1,6 @@
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from mvision.core.config import settings
-
-# 🔥 Debug: confirm DATABASE_URL
-print("\n==============================")
-print(" LOADED DATABASE URL:", settings.database_url)
-print("==============================\n")
+from mvision.core.config import settings 
 
 if not settings.database_url:
     raise ValueError("❌ ERROR: DATABASE URL is EMPTY! Check your .env")
@@ -13,7 +8,7 @@ if not settings.database_url:
 # Create SQLAlchemy engine
 engine = create_engine(
     settings.database_url,
-    echo=True,          # optional: prints all SQL queries
+    echo=False,          # optional: prints all SQL queries
     pool_pre_ping=True  # avoids connection hang issues
 )
 

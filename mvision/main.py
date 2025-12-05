@@ -3,10 +3,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from mvision.routes.user_routes import router as user_router
 from mvision.db.database import engine
 from mvision.db import models
+from mvision.routes.embeddings import router as embeddings_router
+from mvision.services import extract_service
 
 # Create database tables
-models.Base.metadata.drop_all(bind=engine)
-models.Base.metadata.create_all(bind=engine)
+# models.Base.metadata.drop_all(bind=engine)
+# models.Base.metadata.create_all(bind=engine)
 
 
 app = FastAPI(title="My FastAPI App")
@@ -22,7 +24,18 @@ app.add_middleware(
 
 # Include your user router
 app.include_router(user_router, prefix="/users", tags=["Users"])
+app.include_router(embeddings_router)
 
 @app.get("/")
 def root():
     return {"message": "FastAPI project is running!"}
+
+@app.on_event("startup")
+def on_startup():
+    extract_service.init_db()
+    extract_service.init_models()
+    extract_service.ensure_csv_header() 
+
+@app.on_event("shutdown")
+def on_shutdown():
+    extract_service.stop_extraction()

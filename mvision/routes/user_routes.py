@@ -42,9 +42,7 @@ def update_user(id: int, user: user_schema.UserRegister, db: Session = Depends(g
 
     db.commit()
     db.refresh(db_user)
-    return db_user
-
-
+    return db_user 
 # ---------------- DELETE USER ----------------
 @router.delete("/delete/{id}")
 def delete_user(id: int, db: Session = Depends(get_db)):
@@ -58,39 +56,4 @@ def delete_user(id: int, db: Session = Depends(get_db)):
 
     return {"message": "User deleted successfully"}
 
-
-# ============================================================
-# ✅ FIXED: UPDATE USER EMBEDDING PATH
-# ============================================================
-@router.put("/update_embedding/{id}")
-def update_embedding(
-    id: int,
-    data: user_schema.EmbeddingUpdate,
-    db: Session = Depends(get_db)
-):
-    user = db.query(models.User).filter(models.User.id == id).first()
-
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    embeddings_path = data.embeddings_path
-
-    # -------------------------------
-    # ⭐ FIXED LOGIC
-    # -------------------------------
-    if embeddings_path and embeddings_path.strip():
-        # Valid path → update both
-        user.embeddings_path = embeddings_path.strip()
-        user.last_embedding_update_ts = datetime.utcnow()
-    else:
-        # Empty or null → set both to NULL
-        user.embeddings_path = None
-        user.last_embedding_update_ts = None
-
-    db.commit()
-    db.refresh(user)
-
-    return {
-        "message": "Embedding path updated successfully",
-        "user": user
-    }
+ 

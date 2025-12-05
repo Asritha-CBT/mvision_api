@@ -5,7 +5,7 @@ your_project/
 │   ├── main.py
 │   │
 │   ├── core/
-│   │   ├── config.py
+│   │   ├── settings.py
 │   │   └── constants.py
 │   │
 │   ├── db/
@@ -33,5 +33,13 @@ your_project/
 ├── requirements.txt
 └── README.md
 
+# python -m venv venv
+# venv\Scripts\activate
+# pip install -r requirements.txt
+# uvicorn mvision.main:app --reload
 
-uvicorn mvision.main:app --reload
+
+
+# alembic migration
+    1. alembic revision --autogenerate -m "migration message"
+    2. alembic upgrade head 
