@@ -24,6 +24,11 @@ def stop():
     """Stop background extraction."""
     return extract_service.stop_extraction()
 
+@router.delete("/remove/{id}")
+def remove(id: int):
+    """Remove embeddings."""
+    return extract_service.remove_embeddings(id)
+
 
 @router.get("/status")
 def status():
