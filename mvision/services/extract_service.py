@@ -4,8 +4,7 @@ mvision/services/extract_service.py
 Multi-RTSP extraction & embedding service (Postgres + pgvector).
 
 - Saves per-crop records to CSV and crop files.
-- Updates the User.embedding (pgvector) and User.last_embedding_update_ts (UTC).
-- Does NOT assume a separate Embedding model/table (your project uses only users table).
+- Updates the User.embedding (pgvector) and User.last_embedding_update_ts (UTC). 
 - Minimal throttling applied to user updates to reduce DB write pressure (configurable).
 """
 from __future__ import annotations
@@ -576,6 +575,30 @@ def stop_extraction():
     logger.info("Extraction stopped.")
     return {"status": "stopped"}
 
+
+def remove_embeddings(id: int):
+    """    
+    Remove stored embeddings
+    """  
+    print('--------------------------------',id)
+    session = get_session()
+    try: 
+        user = session.query(User).filter(User.id == id).first()
+        if not user: 
+            logger.error("User with id %d not found. Skipping embedding removal.", id)
+            return {"status": "error", "message": f"user id {id} not found" }
+        user.embedding = None
+        user.last_embedding_update_ts = datetime.now(timezone.utc)  
+        session.commit()
+        session.refresh(user)  
+        logger.warning("Embeddings removed for user id=%d", id)
+        return user
+    except Exception as e:
+        session.rollback()    
+        logger.exception("remove embeddings: DB error during user lookup.")
+        return{"status":"error", "message":"DB error"}
+    finally:
+        session.close()    
 
 def get_status():
     """Return current extract_service status."""
