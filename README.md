@@ -38,7 +38,7 @@ your_project/
 # pip install -r requirements.txt
 # uvicorn mvision.main:app --reload
 
-
+# pip install --no-build-isolation "git+https://github.com/KaiyangZhou/deep-person-reid.git
 
 # alembic migration
     1. alembic revision --autogenerate -m "migration message"
