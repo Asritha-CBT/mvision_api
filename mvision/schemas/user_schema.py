@@ -16,11 +16,13 @@ class UserResponse(BaseModel):
     id: int
     name: str
     department: Optional[str] = None
-    embedding: Optional[List[float]] = None   # <-- pgvector field
+    body_embedding: Optional[List[float]] = None   # <-- pgvector field
+    face_embedding: Optional[List[float]] = None   # <-- pgvector field
 
     class Config:
         from_attributes = True
 
 
 class EmbeddingUpdate(BaseModel):
-    embedding: Optional[List[float]] = None
+    body_embedding: Optional[List[float]] = None
+    face_embedding: Optional[List[float]] = None
