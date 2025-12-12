@@ -36,9 +36,9 @@ your_project/
 # python -m venv venv
 # venv\Scripts\activate
 # pip install -r requirements.txt
-# uvicorn mvision.main:app --reload
-
-# pip install --no-build-isolation "git+https://github.com/KaiyangZhou/deep-person-reid.git
+# pip install --no-build-isolation "git+https://github.com/KaiyangZhou/deep-person-reid.git  (cmd)
+# pip install --no-build-isolation git+https://github.com/KaiyangZhou/deep-person-reid.git   (powershell)
+# uvicorn mvision.main:app --reload 
 
 # alembic migration
     1. alembic revision --autogenerate -m "migration message"
