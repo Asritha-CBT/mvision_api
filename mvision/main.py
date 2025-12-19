@@ -1,9 +1,10 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from mvision.routes.user_routes import router as user_router
+from mvision.routes.embeddings import router as embeddings_router
+from mvision.routes.reports import router as report_router
 from mvision.db.database import engine
 from mvision.db import models
-from mvision.routes.embeddings import router as embeddings_router
 from mvision.services import extract_service
 
 # Create database tables
@@ -24,7 +25,12 @@ app.add_middleware(
 
 # Include your user router
 app.include_router(user_router, prefix="/users", tags=["Users"])
-app.include_router(embeddings_router)
+app.include_router(embeddings_router)  
+app.include_router(
+    report_router,
+    prefix="/reports",
+    tags=["Reports"]
+)
 
 @app.get("/")
 def root():

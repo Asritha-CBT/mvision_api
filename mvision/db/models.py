@@ -27,19 +27,16 @@ class UserPresence(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     cam_number = Column(String, nullable=False)
 
-    entry_time = Column(DateTime(timezone=True), nullable=False)
-    exit_time = Column(DateTime(timezone=True), nullable=True)
+    entry_time = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False
+    )
 
-    # time spent in seconds, minutes, etc. Use INTERVAL in PostgreSQL
-    time_spent = Column(Interval, nullable=True)
+    exit_time = Column(
+        DateTime(timezone=True),
+        nullable=True
+    )
 
-    # For date-only or full timestamp — keeping full timestamp for reports
-    date_time = Column(DateTime(timezone=True), default=datetime.utcnow)
-
-    # Optional relationship
-    user = relationship("User", backref="presence_logs")  
-
-@event.listens_for(UserPresence, "before_update")
-def compute_time_spent(mapper, connection, target):
-    if target.exit_time and target.entry_time:
-        target.time_spent = target.exit_time - target.entry_time      
+    user = relationship("User", backref="presence_logs")
+ 

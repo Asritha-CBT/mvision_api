@@ -47,18 +47,21 @@ class EmbeddingUpdate(BaseModel):
 class UserPresenceBase(BaseModel):
     user_id: int
     cam_number: str
-    entry_time: datetime
-    exit_time: datetime | None = None
-    time_spent: timedelta | None = None
-    date_time: datetime | None = None
 
 
 class UserPresenceCreate(UserPresenceBase):
-    pass
+    # entry_time is optional → server_default=now()
+    entry_time: datetime | None = None
 
-
-class UserPresenceResponse(UserPresenceBase):
+class UserPresenceResponse(BaseModel):
     id: int
+    user_id: int
+    user_name: str   
+    cam_number: str
+    cam_name: str
+    entry_time: datetime
+    exit_time: datetime | None
+    duration: timedelta | None
 
     class Config:
-        from_attributes = True    
+        from_attributes = True
