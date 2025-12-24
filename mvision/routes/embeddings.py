@@ -1,12 +1,12 @@
  
 # app/routes/embeddings.py
+from __future__ import annotations 
 from fastapi import APIRouter, Depends, HTTPException 
 from mvision.services import extract_service 
 from mvision.db.database import get_db
 from sqlalchemy.orm import Session
 from sqlalchemy.sql import func
 from mvision.db.models import CameraCategory 
-from __future__ import annotations 
 from pydantic import BaseModel, Field, conint
 from typing import Optional, List, Dict, Any
  
