@@ -1,647 +1,22 @@
-# """
-# mvision/services/extract_service.py
-
-# Multi-RTSP extraction & body_embedding service (Postgres + pgvector).
-
-# - Saves per-crop records to CSV and crop files.
-# - Updates the User.body_embedding (pgvector) and User.last_embedding_update_ts (UTC). 
-# - Minimal throttling applied to user updates to reduce DB write pressure (configurable).
-# """
-# from __future__ import annotations
-
-# import csv
-# import time
-# import threading
-# from pathlib import Path
-# from datetime import datetime, timezone
-# from typing import Optional, List, Dict
-
-# import logging
-
-# import cv2
-# import numpy as np
-# import torch
-
-# from sqlalchemy.sql import func
-
-# from mvision.constants import (
-#     RTSP_STREAMS,
-#     YOLO_WEIGHTS,
-#     DEVICE,
-#     CONF_THRES,
-#     IOU_THRES,
-#     EMB_CSV,
-#     CROPS_ROOT,
-# )
-# from mvision.db.session import get_session, engine
-# from mvision.db.models import Base, User
-
-# # optional imports
-# try:
-#     from ultralytics import YOLO
-# except Exception:
-#     YOLO = None
-
-# try:
-#     from torchreid.utils.feature_extractor import FeatureExtractor as TorchreidExtractor
-# except Exception as e:
-#     print("TorchReID import error:", e)
-#     TorchreidExtractor = None
-
-# # -------------------------
-# # Config / constants
-# # -------------------------
-# # Must match your pgvector size on User.body_embedding
-# EXPECTED_EMBED_DIM = 512
-
-# # Minimum seconds between updates to a single user's body_embedding (to reduce DB writes)
-# EMB_UPDATE_MIN_INTERVAL = 2.0  # seconds, adjust as needed
-
-# # -------------------------
-# # Logging
-# # -------------------------
-# logger = logging.getLogger("mvision.extract_service")
-# if not logger.handlers:
-#     # simple default handler if app hasn't configured logging
-#     ch = logging.StreamHandler()
-#     ch.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
-#     logger.addHandler(ch)
-# logger.setLevel(logging.INFO)
-
-# # -------------------------
-# # Runtime globals & locks
-# # -------------------------
-# yolo_model: YOLO | None = None
-# reid_extractor: TorchreidExtractor | None = None
-
-# yolo_lock = threading.Lock()
-# reid_lock = threading.Lock()
-# csv_lock = threading.Lock()
-# db_lock = threading.Lock()
-# frames_lock = threading.Lock()
-
-# latest_frames: Dict[int, np.ndarray] = {}
-# viewer_thread: Optional[threading.Thread] = None
-# extract_threads: Dict[int, threading.Thread] = {}
-# stop_event = threading.Event()
-# is_running = False
-# current_person_id: Optional[int] = None
-# current_person_name: Optional[str] = None
-
-# # track last update time per user to throttle DB writes
-# _last_user_update_ts: Dict[int, float] = {}
-
-
-# # ------------------ DB helpers ------------------
-# def init_db():
-#     """Create tables if not exists (uses SQLAlchemy models)."""
-#     # Base.metadata.create_all(bind=engine)
-#     logger.info("DB initialized...")
-
-
-# def upsert_user_embedding_by_id(user_id: int, emb_list: List[float]):
-#     """
-#     Update only body_embedding and last_embedding_update_ts for a given user ID.
-#     Does NOT create a new user. Does NOT modify any other fields.
-
-#     Returns:
-#         User ORM instance on success,
-#         None if user not found or dimension mismatch.
-#     """
-
-#     # ensure float list
-#     if not isinstance(emb_list, list):
-#         try:
-#             emb_list = list(map(float, emb_list))
-#         except Exception:
-#             logger.exception("Failed to convert body_embedding to list of floats.")
-#             return None
-
-#     # dimension check
-#     if len(emb_list) != EXPECTED_EMBED_DIM:
-#         logger.warning(
-#             "Embedding dimension mismatch for id=%s: expected %d but got %d",
-#             user_id,
-#             EXPECTED_EMBED_DIM,
-#             len(emb_list),
-#         )
-#         return None
-
-#     with db_lock:
-#         session = get_session()
-#         try:
-#             user = session.query(User).filter(User.id == user_id).first()
-
-#             if not user:
-#                 logger.warning("User ID %s not found. Skipping body_embedding update.", user_id)
-#                 return None
-
-#             # update only 2 fields
-#             user.body_embedding = emb_list
-#             user.last_embedding_update_ts = datetime.now(timezone.utc)
-
-#             session.commit()
-#             session.refresh(user)
-#             logger.info("Updated body_embedding for user id=%s", user_id)
-#             return user
-
-#         except Exception:
-#             session.rollback()
-#             logger.exception("DB error while updating body_embedding for id=%s", user_id)
-#             return None
-#         finally:
-#             session.close()
-
-
-
-# # ------------------ utility ------------------
-# def l2_normalize(v: np.ndarray) -> np.ndarray:
-#     v = np.asarray(v, dtype=np.float32)
-#     n = np.linalg.norm(v)
-#     if n == 0 or not np.isfinite(n):
-#         return v
-#     return v / n
-
-
-# # ------------------ models init ------------------
-# def init_models():
-#     """
-#     Load YOLO + TorchReID once on startup.
-#     """
-#     global yolo_model, reid_extractor
-
-#     gpu = torch.cuda.is_available() and ("cuda" in DEVICE)
-#     logger.info("init_models device=%s gpu_available=%s", DEVICE, torch.cuda.is_available())
-
-#     # YOLO
-#     if YOLO is not None:
-#         try:
-#             weights = YOLO_WEIGHTS
-#             if not Path(weights).exists():
-#                 logger.warning("%s not found, falling back to yolov8n.pt", weights)
-#                 weights = "yolov8n.pt"
-#             yolo_model = YOLO(weights)
-#             if gpu:
-#                 try:
-#                     yolo_model.to(DEVICE)
-#                 except Exception:
-#                     # some YOLO wrapper ignore .to(); ignore failures
-#                     pass
-#             logger.info("YOLO ready")
-#         except Exception:
-#             logger.exception("YOLO load failed; detection disabled.")
-#             yolo_model = None
-#     else:
-#         logger.warning("ultralytics not installed; detection disabled.")
-
-#     # TorchReID
-#     if TorchreidExtractor is not None:
-#         try:
-#             reid_extractor = TorchreidExtractor(
-#                 model_name="osnet_x0_25",
-#                 device=(DEVICE if gpu else "cpu"),
-#             )
-#             logger.info("TorchReID extract_service ready")
-#         except Exception:
-#             logger.exception("TorchReID init failed; embeddings disabled.")
-#             reid_extractor = None
-#     else:
-#         logger.warning("torchreid not installed; embeddings disabled.")
-
-
-# # ------------------ CSV + crops helpers ------------------
-# def ensure_csv_header():
-#     if not Path(EMB_CSV).exists():
-#         with csv_lock:
-#             with open(EMB_CSV, "w", newline="", encoding="utf-8") as f:
-#                 w = csv.writer(f)
-#                 w.writerow(
-#                     [
-#                         "user_id",
-#                         "ts",
-#                         "cam_idx",
-#                         "frame_idx",
-#                         "det_idx",
-#                         "x1",
-#                         "y1",
-#                         "x2",
-#                         "y2",
-#                         "conf",
-#                         "body_embedding",
-#                         "crop_path",
-#                     ]
-#                 )
-#         logger.info("Created CSV header: %s", EMB_CSV)
-
-
-# def ensure_crops_dir(cam_idx: int) -> Path:
-#     cam_dir = Path(CROPS_ROOT) / f"{current_person_name}" / f"cam{cam_idx}"
-#     cam_dir.mkdir(parents=True, exist_ok=True)
-#     return cam_dir
-
-
-# # ------------------ worker loops ------------------
-# def _should_update_user(id: int) -> bool:
-#     """Return True if sufficient time passed since last update for this user."""
-#     now = time.time()
-#     last = _last_user_update_ts.get(id)
-#     if last is None or (now - last) >= EMB_UPDATE_MIN_INTERVAL:
-#         _last_user_update_ts[id] = now
-#         return True
-#     return False
-
-
-# def embedding_loop_for_cam(cam_idx: int, rtsp_url: str):
-#     """
-#     Open RTSP for one camera, run YOLO on persons,
-#     draw bounding boxes, extract embeddings, save crops + CSV,
-#     update User.body_embedding and last_embedding_update_ts for current_person_id (throttled).
-#     """
-#     global current_person_id
-#     global current_person_name
-
-#     ensure_csv_header()
-#     cam_dir = ensure_crops_dir(cam_idx)
-
-#     cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
-#     if not cap.isOpened():
-#         logger.error("[cam%d] cannot open RTSP: %s", cam_idx, rtsp_url)
-#         return
-
-#     frame_idx = 0
-#     logger.info("[Loop cam%d] started on %s", cam_idx, rtsp_url)
-
-#     try:
-#         while not stop_event.is_set():
-#             ok, frame = cap.read()
-#             if not ok or frame is None:
-#                 logger.warning("[Loop cam%d] frame read failed, breaking", cam_idx)
-#                 break
-
-#             frame_idx += 1
-#             H, W = frame.shape[:2]
-#             detections = []  # list of (x1, y1, x2, y2, conf)
-#             vis = frame.copy()
-
-#             # --- YOLO detection ---
-#             if yolo_model is not None:
-#                 try:
-#                     with yolo_lock:
-#                         res = yolo_model(frame, conf=CONF_THRES, iou=IOU_THRES, verbose=False)
-#                     boxes = res[0].boxes if (res and len(res)) else None
-#                     if boxes is not None:
-#                         xyxy = boxes.xyxy.detach().cpu().numpy().astype(np.float32)
-#                         confs = boxes.conf.detach().cpu().numpy().astype(np.float32)
-#                         cls = boxes.cls.detach().cpu().numpy().astype(np.int32)
-
-#                         keep = (cls == 0)  # class 0 = person
-#                         xyxy, confs = xyxy[keep], confs[keep]
-
-#                         for (x1, y1, x2, y2), c in zip(xyxy, confs):
-#                             x1f = float(max(0, min(W - 1, x1)))
-#                             y1f = float(max(0, min(H - 1, y1)))
-#                             x2f = float(max(0, min(W - 1, x2)))
-#                             y2f = float(max(0, min(H - 1, y2)))
-#                             detections.append((x1f, y1f, x2f, y2f, float(c)))
-#                 except Exception:
-#                     logger.exception("[Loop cam%d] YOLO error", cam_idx)
-
-#             # --- Embedding extraction + CSV + user update ---
-#             if reid_extractor is not None and detections and current_person_id:
-#                 det_idx = 0
-#                 for (x1, y1, x2, y2, conf) in detections:
-#                     x1i, y1i, x2i, y2i = map(int, [x1, y1, x2, y2])
-#                     x1i, y1i = max(0, x1i), max(0, y1i)
-#                     x2i, y2i = min(W, x2i), min(H, y2i)
-
-#                     if x2i <= x1i or y2i <= y1i:
-#                         continue
-
-#                     # draw box
-#                     cv2.rectangle(vis, (x1i, y1i), (x2i, y2i), (0, 255, 0), 2)
-#                     label = f"{current_person_id} cam{cam_idx}"
-#                     cv2.putText(
-#                         vis,
-#                         label,
-#                         (x1i, max(0, y1i - 5)),
-#                         cv2.FONT_HERSHEY_SIMPLEX,
-#                         0.6,
-#                         (0, 255, 0),
-#                         2,
-#                     )
-
-#                     crop = frame[y1i:y2i, x1i:x2i]
-
-#                     # save crop
-#                     crop_filename = f"frame_{current_person_id}_{current_person_name}_{frame_idx:06d}_det{det_idx}.jpg"
-#                     crop_path = cam_dir / crop_filename
-#                     try:
-#                         cv2.imwrite(str(crop_path), crop)
-#                     except Exception:
-#                         logger.exception("[Loop cam%d] crop save error", cam_idx)
-#                         continue
-
-#                     # extract body_embedding
-#                     try:
-#                         with reid_lock:
-#                             feats = reid_extractor([crop])  # list-of-image API
-
-#                         feat = feats[0]
-#                         if hasattr(feat, "detach"):
-#                             feat = feat.detach().cpu().numpy()
-#                         elif not isinstance(feat, np.ndarray):
-#                             feat = np.asarray(feat)
-
-#                         feat = l2_normalize(feat)
-#                         emb_list = feat.tolist()
-#                         body_embedding_str = " ".join(f"{v:.6f}" for v in feat.tolist())
-#                         ts = time.time()
-
-#                         # append to CSV
-#                         with csv_lock:
-#                             with open(EMB_CSV, "a", newline="", encoding="utf-8") as f:
-#                                 w = csv.writer(f)
-#                                 w.writerow(
-#                                     [
-#                                         current_person_id,
-#                                         current_person_name,
-#                                         ts,
-#                                         cam_idx,
-#                                         frame_idx,
-#                                         det_idx,
-#                                         x1i,
-#                                         y1i,
-#                                         x2i,
-#                                         y2i,
-#                                         conf,
-#                                         body_embedding_str,
-#                                         str(crop_path),
-#                                     ]
-#                                 )
-
-#                         # Update User.body_embedding (throttled)
-#                         try:
-#                             if _should_update_user(current_person_id):
-#                                 upsert_user_embedding_by_id(current_person_id, emb_list)
-#                         except Exception:
-#                             logger.exception(
-#                                 "[Loop cam%d] failed updating user body_embedding for '%s'",
-#                                 cam_idx,
-#                                 current_person_id,
-#                             )
-
-#                         det_idx += 1
-#                     except Exception:
-#                         logger.exception("[Loop cam%d] body_embedding/processing error", cam_idx)
-#             else:
-#                 # draw boxes for visualization only
-#                 for (x1, y1, x2, y2, conf) in detections:
-#                     x1i, y1i, x2i, y2i = map(int, [x1, y1, x2, y2])
-#                     x1i, y1i = max(0, x1i), max(0, y1i)
-#                     x2i, y2i = min(W, x2i), min(H, y2i)
-#                     if x2i <= x1i or y2i <= y1i:
-#                         continue
-#                     cv2.rectangle(vis, (x1i, y1i), (x2i, y2i), (0, 255, 0), 2)
-#                     label = f"cam{cam_idx}"
-#                     cv2.putText(
-#                         vis,
-#                         label,
-#                         (x1i, max(0, y1i - 5)),
-#                         cv2.FONT_HERSHEY_SIMPLEX,
-#                         0.6,
-#                         (0, 255, 0),
-#                         2,
-#                     )
-
-#             # store latest frame
-#             with frames_lock:
-#                 latest_frames[cam_idx] = vis
-
-#             # periodic log
-#             if frame_idx % 50 == 0:
-#                 logger.info("[Loop cam%d] frame %d, detections=%d", cam_idx, frame_idx, len(detections))
-
-#     finally:
-#         cap.release()
-#         logger.info("[Loop cam%d] stopped", cam_idx)
-
-
-# # ------------------ viewer ------------------
-# def viewer_loop():
-#     """Combine all latest_frames horizontally and show in one OpenCV window."""
-#     logger.info("[Viewer] started")
-#     window_name = "Multi-RTSP Viewer"
-#     try:
-#         while not stop_event.is_set():
-#             with frames_lock:
-#                 if not latest_frames:
-#                     frames = []
-#                 else:
-#                     frames = [
-#                         latest_frames[idx]
-#                         for idx in sorted(latest_frames.keys())
-#                         if latest_frames[idx] is not None
-#                     ]
-
-#             if not frames:
-#                 time.sleep(0.01)
-#                 continue
-
-#             # make same height
-#             min_h = min(f.shape[0] for f in frames)
-#             resized = []
-#             for f in frames:
-#                 h, w = f.shape[:2]
-#                 if h != min_h:
-#                     new_w = int(w * (min_h / h))
-#                     f = cv2.resize(f, (new_w, min_h))
-#                 resized.append(f)
-
-#             try:
-#                 combined = np.concatenate(resized, axis=1)
-#             except Exception:
-#                 time.sleep(0.01)
-#                 continue
-
-#             cv2.imshow(window_name, combined)
-#             key = cv2.waitKey(1) & 0xFF
-#             if key in (ord("q"), 27):  # q or ESC
-#                 logger.info("[Viewer] key pressed, stopping...")
-#                 stop_event.set()
-#                 break
-
-#             time.sleep(0.01)
-#     finally:
-#         cv2.destroyAllWindows()
-#         logger.info("[Viewer] stopped")
-
-
-# # ------------------ control API used by routes ------------------
-# def start_extraction(id: int):
-#     """
-#     Start extraction threads for all RTSP streams and viewer thread.
-#     id: the user_id whose embeddings will be updated.
-#     """
-#     global extract_threads, viewer_thread, is_running
-#     global current_person_id, current_person_name
-
-#     if is_running:
-#         logger.warning("Extraction already running for '%s'", current_person_name)
-#         return {"status": "already_running", "id": current_person_id, "name": current_person_name}
-
-#     if not RTSP_STREAMS:
-#         logger.error("RTSP_STREAMS is empty.")
-#         return {"status": "error", "message": "RTSP_STREAMS empty"}
-
-#     # -----------------------------------------
-#     # Fetch user name based on ID
-#     # -----------------------------------------
-#     session = get_session()
-#     try:
-#         user = session.query(User).filter(User.id == id).first()
-
-#         if not user:
-#             logger.error("User with id %d not found. Extraction aborted.", id)
-#             return {"status": "error", "message": f"user id {id} not found"}
-
-#         current_person_id = id
-#         current_person_name = user.name  # SET NAME HERE
-
-#         logger.info("Extraction will run for user: id=%d name='%s'",
-#                     current_person_id, current_person_name)
-
-#     except Exception as e:
-#         session.rollback()
-#         logger.exception("DB error during user lookup.")
-#         return {"status": "error", "message": "DB error"}
-#     finally:
-#         session.close()
-
-#     # -----------------------------------------
-#     # start extraction threads
-#     # -----------------------------------------
-#     stop_event.clear()
-#     extract_threads = {}
-
-#     with frames_lock:
-#         latest_frames.clear()
-
-#     for idx, url in enumerate(RTSP_STREAMS):
-#         t = threading.Thread(target=embedding_loop_for_cam, args=(idx, url), daemon=True)
-#         extract_threads[idx] = t
-#         t.start()
-
-#     viewer_thread = threading.Thread(target=viewer_loop, daemon=True)
-#     viewer_thread.start()
-
-#     is_running = True
-
-#     return {
-#         "status": "started",
-#         "num_cams": len(RTSP_STREAMS),
-#         "id": current_person_id,
-#         "name": current_person_name,
-#     }
-
-
-
-# def stop_extraction():
-#     """
-#     Stop extraction and viewer threads gracefully.
-#     """
-#     global extract_threads, is_running, viewer_thread, current_person_id
-
-#     if not is_running:
-#         logger.info("stop_extraction called but extract_service is not running.")
-#         return {"status": "not_running"}
-
-#     stop_event.set()
-#     for idx, t in extract_threads.items():
-#         try:
-#             t.join(timeout=10.0)
-#         except Exception:
-#             logger.exception("Error joining thread for cam %d", idx)
-
-#     if viewer_thread is not None:
-#         try:
-#             viewer_thread.join(timeout=10.0)
-#         except Exception:
-#             logger.exception("Error joining viewer thread")
-
-#     extract_threads = {}
-#     is_running = False
-#     # clear current person id (optional)
-#     current_person_id = None
-#     logger.info("Extraction stopped.")
-#     return {"status": "stopped"}
-
-
-# def remove_embeddings(id: int):
-#     """    
-#     Remove stored embeddings
-#     """  
-#     print('--------------------------------',id)
-#     session = get_session()
-#     try: 
-#         user = session.query(User).filter(User.id == id).first()
-#         if not user: 
-#             logger.error("User with id %d not found. Skipping body_embedding removal.", id)
-#             return {"status": "error", "message": f"user id {id} not found" }
-#         user.body_embedding = None
-#         user.last_embedding_update_ts = datetime.now(timezone.utc)  
-#         session.commit()
-#         session.refresh(user)  
-#         logger.warning("Embeddings removed for user id=%d", id)
-#         return user
-#     except Exception as e:
-#         session.rollback()    
-#         logger.exception("remove embeddings: DB error during user lookup.")
-#         return{"status":"error", "message":"DB error"}
-#     finally:
-#         session.close()    
-
-# def get_status():
-#     """Return current extract_service status."""
-#     return {
-#         "running": is_running,
-#         "num_cams": len(RTSP_STREAMS),
-#         "rtsp_streams": RTSP_STREAMS,
-#         "id": current_person_id,
-#     }
-
-# File: mvision/services/extract_service.py
-# File: mvision/services/extract_service.py
-# File: mvision/services/extract_service.py
-# File: mvision/services/extract_service.py
-# File: mvision/services/extract_service.py
-# File: mvision/services/extract_service.py
-"""
-Multi-RTSP extraction & embeddings service (Postgres + pgvector).
-
-- YOLO: person detection.
-- TorchReID: BODY 512-D float32 L2-normalized embeddings (RGB crop).
-- InsightFace: FACE 512-D float32 L2-normalized embeddings.
-- Robust face↔person link: center-in-box OR IoU OR inter/face_area.
-- CSV: body_embedding, face_embedding.
-- DB: User.body_embedding, User.face_embedding (+ last_embedding_update_ts).
-"""
+# file: mvision/services/extract_service.py
 from __future__ import annotations
 
 import csv
 import sys
+import os
 import time
 import threading
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Optional, List, Dict, Tuple
-
+from typing import Optional, List, Dict, Tuple, Callable
+from queue import Queue, Empty
 import logging
+import shutil
+import random
 
 import cv2
 import numpy as np
 import torch
-
-from sqlalchemy.sql import func  # kept if used elsewhere
 
 from mvision.constants import (
     RTSP_STREAMS,
@@ -655,20 +30,33 @@ from mvision.constants import (
 from mvision.db.session import get_session, engine
 from mvision.db.models import Base, User
 
+# ------------------------- runtime perf knobs -------------------------
+try:
+    torch.backends.cudnn.benchmark = True
+except Exception:
+    pass
+try:
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
+except Exception:
+    pass
+try:
+    cv2.setNumThreads(1)
+except Exception:
+    pass
+
 # ------------------------- optional libs -------------------------
 try:
     from ultralytics import YOLO
 except Exception:
     YOLO = None
 
-# Use same TorchReID extractor type as your other pipeline
 try:
     from torchreid.utils import FeatureExtractor as TorchreidExtractor
 except Exception as e:
     print("TorchReID import error:", e)
     TorchreidExtractor = None
 
-# InsightFace + ONNX Runtime
 try:
     from insightface.app import FaceAnalysis
     INSIGHT_OK = True
@@ -683,18 +71,32 @@ except Exception:
 
 # ------------------------- config -------------------------
 EXPECTED_EMBED_DIM = 512
-EMB_UPDATE_MIN_INTERVAL = 2.0  # seconds
 
-# Face config
+# Face capture/link gates (capture-time only)
 USE_FACE = True
 FACE_MODEL = "buffalo_l"
 FACE_DET_SIZE = (640, 640)         # (w, h)
 FACE_PROVIDER = "auto"             # "auto" | "cuda" | "cpu"
+FACE_MIN_SCORE = 0.5
+FACE_MIN_SIZE = 32                 # px min(side) of detected face
+FACE_IOU_LINK = 0.05
+FACE_OVER_FACE_LINK = 0.60
+FACE_EVERY = 2
 
-# Link thresholds (choose one to succeed)
-FACE_IOU_LINK = 0.05               # small face vs large person => IoU tiny; keep low
-FACE_OVER_FACE_LINK = 0.60         # inter_area / face_area
-# center-in-box is always accepted
+# YOLO inference size
+YOLO_IMGSZ = 640
+
+# Queues
+CAP_QUEUE_MAX = 2
+IO_QUEUE_MAX  = 1024
+
+# Viewer FPS throttle
+VIEWER_SLEEP_MS = 5
+
+# ======= stronger embeddings knobs =======
+REID_MODELS = ["osnet_x1_0", "osnet_x0_25"]  # strong → light
+BODY_TTA_FLIP = True
+FACE_TTA_FLIP = True
 
 # ------------------------- logging -------------------------
 logger = logging.getLogger("mvision.extract_service")
@@ -706,102 +108,115 @@ logger.setLevel(logging.INFO)
 
 # ------------------------- globals -------------------------
 yolo_model: YOLO | None = None
-reid_extractor: TorchreidExtractor | None = None
+reid_extractor: TorchreidExtractor | None = None   # legacy single ref
+reid_extractors: List[TorchreidExtractor] = []     # ensemble
 face_app: FaceAnalysis | None = None
 
 yolo_lock = threading.Lock()
 reid_lock = threading.Lock()
 csv_lock = threading.Lock()
-db_lock = threading.Lock()
 frames_lock = threading.Lock()
 
 latest_frames: Dict[int, np.ndarray] = {}
-viewer_thread: Optional[threading.Thread] = None
+
+capture_threads: Dict[int, threading.Thread] = {}
 extract_threads: Dict[int, threading.Thread] = {}
+cap_queues: Dict[int, Queue] = {}
+
+io_thread: Optional[threading.Thread] = None
+io_queue: Queue | None = None
+
+viewer_thread: Optional[threading.Thread] = None
 stop_event = threading.Event()
 is_running = False
 current_person_id: Optional[int] = None
 current_person_name: Optional[str] = None
 
-_last_user_update_ts: Dict[int, float] = {}
+# ---- extraction progress state (for /extract) ----
+progress_lock = threading.Lock()
+progress_state: Dict[int, Dict[str, object]] = {}
 
-# ------------------ DB helpers ------------------
-def init_db():
-    # Base.metadata.create_all(bind=engine)
-    logger.info("DB initialized...")
+# ------------------ progress helpers ------------------
+def _progress_reset(user_id: int, user_name: str) -> None:
+    with progress_lock:
+        progress_state[user_id] = {
+            "user_name": user_name,
+            "stage": "idle",
+            "total_body": 0,
+            "total_face": 0,
+            "done_body": 0,
+            "done_face": 0,
+            "percent": 0,
+            "message": "waiting",
+        }
 
-def _to_float_list(x) -> Optional[List[float]]:
-    if x is None:
-        return None
-    if isinstance(x, list) and all(isinstance(v, (float, int)) for v in x):
-        return [float(v) for v in x]
+def _progress_set(user_id: int, **kv) -> None:
+    with progress_lock:
+        st = progress_state.get(user_id)
+        if not st:
+            st = {}
+            progress_state[user_id] = st
+        st.update(kv)
+
+        tb, tf = int(st.get("total_body", 0)), int(st.get("total_face", 0))
+        db, df = int(st.get("done_body", 0)), int(st.get("done_face", 0))
+        db = max(0, min(db, tb))
+        df = max(0, min(df, tf))
+        st["done_body"], st["done_face"] = db, df
+
+        stage = str(st.get("stage", "")).lower()
+        if stage == "embedding_body" and tb > 0:
+            pct = int(round((db / max(1, tb)) * 100))
+        elif stage == "embedding_face" and tf > 0:
+            pct = int(round((df / max(1, tf)) * 100))
+        else:
+            tot = max(1, tb + tf)
+            pct = int(round(((db + df) / tot) * 100))
+        st["percent"] = max(0, min(100, pct))
+
+def get_progress_for_user(user_id: int) -> Dict[str, object]:
+    with progress_lock:
+        st = progress_state.get(user_id)
+        return dict(st) if st else {
+            "stage": "unknown",
+            "percent": 0,
+            "message": "no job",
+            "total_body": 0,
+            "total_face": 0,
+            "done_body": 0,
+            "done_face": 0,
+        }
+
+# ------------------ init_db (startup hook) ------------------
+def init_db() -> None:
     try:
-        arr = np.asarray(x, dtype=np.float32).reshape(-1)
-        return [float(v) for v in arr.tolist()]
+        Base.metadata.create_all(bind=engine)
+        logger.info("DB initialized.")
     except Exception:
-        return None
-
-def _dim_ok(vec: Optional[List[float]]) -> bool:
-    return (vec is None) or (len(vec) == EXPECTED_EMBED_DIM)
-
-def upsert_user_embeddings_by_id(user_id: int,
-                                 body: Optional[List[float]] = None,
-                                 face: Optional[List[float]] = None):
-    """
-    Update any provided embeddings for a user:
-      - User.body_embedding (if `body` provided)
-      - User.face_embedding (if `face` provided)
-      - Always bump last_embedding_update_ts on any change.
-    """
-    body = _to_float_list(body)
-    face = _to_float_list(face)
-
-    if not _dim_ok(body) or not _dim_ok(face):
-        logger.warning("Embedding dim mismatch for id=%s (expected %d)", user_id, EXPECTED_EMBED_DIM)
-        return None
-
-    if body is None and face is None:
-        return None
-
-    with db_lock:
-        session = get_session()
-        try:
-            user = session.query(User).filter(User.id == user_id).first()
-            if not user:
-                logger.warning("User ID %s not found. Skipping update.", user_id)
-                return None
-
-            changed = False
-            if body is not None:
-                user.body_embedding = body
-                changed = True
-            if face is not None:
-                user.face_embedding = face
-                changed = True
-            if changed:
-                user.last_embedding_update_ts = datetime.now(timezone.utc)
-                session.commit()
-                session.refresh(user)
-                logger.info("Updated embeddings for user id=%s (body=%s, face=%s)",
-                            user_id, body is not None, face is not None)
-            return user if changed else None
-        except Exception:
-            session.rollback()
-            logger.exception("DB error while updating embeddings for id=%s", user_id)
-            return None
-        finally:
-            session.close()
+        logger.exception("DB init failed")
 
 # ------------------ utils ------------------
 def l2_normalize(v: np.ndarray) -> np.ndarray:
-    v = np.asarray(v, dtype=np.float32)
-    n = np.linalg.norm(v)
-    if n == 0 or not np.isfinite(n):
+    v = np.asarray(v, dtype=np.float32).reshape(-1)
+    n = float(np.linalg.norm(v))
+    if n == 0.0 or not np.isfinite(n):
         return v
     return v / n
 
+def _as_512f(vec: np.ndarray | list | None) -> Optional[np.ndarray]:
+    if vec is None:
+        return None
+    try:
+        a = np.asarray(vec, dtype=np.float32).reshape(-1)
+        if a.size != EXPECTED_EMBED_DIM:
+            return None
+        if not np.isfinite(a).all():
+            return None
+        return l2_normalize(a)
+    except Exception:
+        return None
+
 def _to_rgb(img_bgr: np.ndarray) -> np.ndarray:
-    # TorchReID expects RGB input
     return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
 def iou_xyxy(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> float:
@@ -817,7 +232,6 @@ def iou_xyxy(a: Tuple[float, float, float, float], b: Tuple[float, float, float,
     return inter / denom if denom > 0 else 0.0
 
 def inter_over_face(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> float:
-    # Intersection area divided by face box area (b)
     ax1, ay1, ax2, ay2 = a
     bx1, by1, bx2, by2 = b
     inter_x1, inter_y1 = max(ax1, bx1), max(ay1, by1)
@@ -828,7 +242,6 @@ def inter_over_face(a: Tuple[float, float, float, float], b: Tuple[float, float,
     return inter / face_area if face_area > 0 else 0.0
 
 def face_center_in(a: Tuple[int, int, int, int], b: Tuple[float, float, float, float]) -> bool:
-    # Is face center inside person box?
     fx1, fy1, fx2, fy2 = a
     px1, py1, px2, py2 = b
     cx = (fx1 + fx2) * 0.5
@@ -844,7 +257,6 @@ def safe_iter_faces(obj):
         return [obj]
 
 def extract_face_embedding(face):
-    # Correct attribute names across insightface versions
     emb = getattr(face, "normed_embedding", None)
     if emb is None:
         emb = getattr(face, "embedding", None)
@@ -854,12 +266,12 @@ def _cuda_ep_loadable() -> bool:
     if ort is None:
         return False
     try:
-        if sys.platform.startswith("darwin"):
+        if sys.platform.startswith("mac"):
             return False
         from pathlib import Path as _P
-        import os as _os, ctypes as _ct
+        import ctypes as _ct
         capi_dir = _P(ort.__file__).parent / "capi"
-        name = "onnxruntime_providers_cuda.dll" if _os.name == "nt" else "libonnxruntime_providers_cuda.so"
+        name = "onnxruntime_providers_cuda.dll" if os.name == "nt" else "libonnxruntime_providers_cuda.so"
         lib_path = capi_dir / name
         if not lib_path.exists():
             return False
@@ -868,6 +280,7 @@ def _cuda_ep_loadable() -> bool:
     except Exception:
         return False
 
+# ------------------ models init ------------------
 def init_face_engine(use_face: bool, device: str, face_model: str, det_w: int, det_h: int, face_provider: str):
     if not use_face:
         return None
@@ -882,8 +295,6 @@ def init_face_engine(use_face: bool, device: str, face_model: str, det_w: int, d
         if face_provider == "cuda":
             if cuda_ok:
                 providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-            else:
-                logger.info("Requested CUDA EP, but not loadable. Using CPU.")
         elif face_provider == "auto":
             if is_cuda and cuda_ok:
                 providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
@@ -895,17 +306,21 @@ def init_face_engine(use_face: bool, device: str, face_model: str, det_w: int, d
         except TypeError:
             app.prepare(ctx_id=ctx_id)
         logger.info("InsightFace ready (model=%s, providers=%s).", face_model, providers)
+        try:
+            dummy = np.zeros((max(8, det_h), max(8, det_w), 3), dtype=np.uint8)
+            app.get(dummy)
+        except Exception:
+            pass
         return app
     except Exception:
         logger.exception("InsightFace init failed")
         return None
 
-# ------------------ models init ------------------
 def init_models():
-    """Load YOLO + TorchReID + InsightFace once on startup."""
-    global yolo_model, reid_extractor, face_app
+    """Load YOLO + TorchReID(backbones) + InsightFace once on startup."""
+    global yolo_model, reid_extractor, reid_extractors, face_app
 
-    gpu = torch.cuda.is_available() and ("cuda" in DEVICE.lower())
+    gpu = torch.cuda.is_available() and ("cuda" in str(DEVICE).lower())
     logger.info("init_models device=%s gpu_available=%s", DEVICE, torch.cuda.is_available())
 
     # YOLO
@@ -914,89 +329,104 @@ def init_models():
             weights = YOLO_WEIGHTS
             if not Path(weights).exists():
                 logger.warning("%s not found, falling back to yolov8n.pt", weights)
-                weights = "yolov8n.pt"
-            yolo_model = YOLO(weights)
+            yolo = YOLO(weights if Path(YOLO_WEIGHTS).exists() else "yolov8n.pt")
             if gpu:
                 try:
-                    yolo_model.to(DEVICE)
+                    yolo.to(DEVICE)
                 except Exception:
                     pass
-            logger.info("YOLO ready")
+            try:
+                with torch.inference_mode():
+                    _dummy = np.zeros((YOLO_IMGSZ, YOLO_IMGSZ, 3), dtype=np.uint8)
+                    yolo.predict(_dummy, device=DEVICE if gpu else "cpu",
+                                 conf=0.25, iou=0.5, imgsz=YOLO_IMGSZ, verbose=False)
+            except Exception:
+                pass
+            yolo_model = yolo
+            logger.info("YOLO ready (gpu=%s)", gpu)
         except Exception:
             logger.exception("YOLO load failed; detection disabled.")
             yolo_model = None
     else:
         logger.warning("ultralytics not installed; detection disabled.")
 
-    # TorchReID
+    # TorchReID ensemble
+    reid_extractors.clear()
     if TorchreidExtractor is not None:
         try:
-            reid_extractor = TorchreidExtractor(
-                model_name="osnet_x0_25",
-                device=(DEVICE if gpu else "cpu"),
-            )
-            logger.info("TorchReID extract_service ready")
+            dev = DEVICE if gpu else "cpu"
+            for m in REID_MODELS:
+                try:
+                    ext = TorchreidExtractor(model_name=m, device=dev)
+                    try:
+                        dummy = np.zeros((256, 128, 3), dtype=np.uint8)
+                        _ = ext([dummy])
+                    except Exception:
+                        pass
+                    reid_extractors.append(ext)
+                    logger.info("TorchReID ready: %s (%s)", m, dev)
+                except Exception:
+                    logger.exception("TorchReID init failed for %s", m)
+            globals()["reid_extractor"] = reid_extractors[0] if reid_extractors else None
         except Exception:
-            logger.exception("TorchReID init failed; embeddings disabled.")
-            reid_extractor = None
+            logger.exception("TorchReID init failed; body embeddings disabled.")
+            reid_extractors.clear()
+            globals()["reid_extractor"] = None
     else:
-        logger.warning("torchreid not installed; embeddings disabled.")
+        logger.warning("torchreid not installed; body embeddings disabled.")
 
     # InsightFace
-    face_app = init_face_engine(
+    globals()["face_app"] = init_face_engine(
         USE_FACE, DEVICE, FACE_MODEL, FACE_DET_SIZE[0], FACE_DET_SIZE[1], FACE_PROVIDER
     )
 
-# ------------------ CSV + crops helpers ------------------
+# ------------------ CSV + gallery helpers ------------------
+def _ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
 def ensure_csv_header():
+    _ensure_dir(Path(EMB_CSV).parent if Path(EMB_CSV).parent.as_posix() not in (".", "") else Path("."))
     if not Path(EMB_CSV).exists():
         with csv_lock:
             with open(EMB_CSV, "w", newline="", encoding="utf-8") as f:
                 w = csv.writer(f)
                 w.writerow(
                     [
-                        "user_id",
-                        "user_name",
-                        "ts",
-                        "cam_idx",
-                        "frame_idx",
-                        "det_idx",
-                        "x1",
-                        "y1",
-                        "x2",
-                        "y2",
-                        "conf",
-                        "body_embedding",
-                        "face_embedding",
-                        "crop_path",
+                        "user_id","user_name","ts","cam_idx","frame_idx","det_idx",
+                        "x1","y1","x2","y2","conf_or_score",
+                        "body_embedding","face_embedding","crop_path","kind",
                     ]
                 )
         logger.info("Created CSV header: %s", EMB_CSV)
 
-def ensure_crops_dir(cam_idx: int) -> Path:
-    cam_dir = Path(CROPS_ROOT) / f"{current_person_name}" / f"cam{cam_idx}"
-    cam_dir.mkdir(parents=True, exist_ok=True)
-    return cam_dir
+def _gallery_body_dir(user_name: str) -> Path:
+    d = Path(CROPS_ROOT) / "gallery" / user_name
+    _ensure_dir(d)
+    return d
 
-# ------------------ throttling ------------------
-def _should_update_user(id: int) -> bool:
-    now = time.time()
-    last = _last_user_update_ts.get(id)
-    if last is None or (now - last) >= EMB_UPDATE_MIN_INTERVAL:
-        _last_user_update_ts[id] = now
-        return True
-    return False
+def _gallery_face_dir(user_name: str) -> Path:
+    d = Path(CROPS_ROOT) / "gallery_face" / user_name
+    _ensure_dir(d)
+    return d
 
-# ------------------ face on frame ------------------
-def detect_faces_and_embeddings(frame: np.ndarray) -> List[Dict]:
-    """Return [{'bbox': (x1,y1,x2,y2), 'emb': np.ndarray}]"""
+def clear_user_galleries(user_name: str):
+    for base in ("gallery", "gallery_face"):
+        root = Path(CROPS_ROOT) / base / user_name
+        if root.exists():
+            shutil.rmtree(root, ignore_errors=True)
+        _ensure_dir(root)
+    logger.info("Cleared galleries for '%s'", user_name)
+
+def _epoch_ms() -> int:
+    return int(time.time() * 1000) * 1000 + random.randint(0, 999)
+
+# ------------------ face helpers (capture-time) ------------------
+def detect_faces_raw(frame: np.ndarray):
     outs: List[Dict] = []
     if face_app is None:
         return outs
     try:
-        faces = face_app.get(frame)
-        if faces:
-            logger.debug("[Face] detected=%d", len(faces))
+        faces = face_app.get(np.ascontiguousarray(frame))
         for f in safe_iter_faces(faces):
             bbox = getattr(f, "bbox", None)
             if bbox is None:
@@ -1005,228 +435,251 @@ def detect_faces_and_embeddings(frame: np.ndarray) -> List[Dict]:
             if b.size < 4:
                 continue
             x1, y1, x2, y2 = map(float, b[:4])
-            emb = extract_face_embedding(f)
-            if emb is None:
-                continue
-            emb = l2_normalize(np.asarray(emb, dtype=np.float32))  # float32 L2
-            outs.append({"bbox": (x1, y1, x2, y2), "emb": emb})
+            score = float(getattr(f, "det_score", 0.0))
+            outs.append({"bbox": (x1, y1, x2, y2), "score": score})
     except Exception:
         logger.exception("FaceAnalysis error")
     return outs
 
 def link_face_to_person(face_bbox: Tuple[float, float, float, float],
                         person_bbox: Tuple[int, int, int, int]) -> bool:
-    """Return True if the face bbox belongs to the person bbox."""
-    # Accept if center of face is inside person bbox
     if face_center_in(tuple(map(int, face_bbox)), person_bbox):
         return True
-    # Else check IoU
     if iou_xyxy(person_bbox, face_bbox) >= FACE_IOU_LINK:
         return True
-    # Else check that most of the face is inside the person box
     if inter_over_face(person_bbox, face_bbox) >= FACE_OVER_FACE_LINK:
         return True
     return False
 
-# ------------------ worker loop ------------------
+# ------------------ RTSP helpers ------------------
+def _configure_rtsp_capture(cap: cv2.VideoCapture) -> None:
+    try:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except Exception:
+        pass
+
+def _read_latest_frame(cap: cv2.VideoCapture) -> Tuple[bool, Optional[np.ndarray]]:
+    grabbed = cap.grab()
+    if not grabbed:
+        ok, fr = cap.read()
+        return ok, (fr if ok else None)
+    for _ in range(3):
+        if not cap.grab():
+            break
+    ok, frame = cap.retrieve()
+    return ok, (frame if ok else None)
+
+# ------------------ async workers (IO) ------------------
+def start_workers_if_needed():
+    global io_thread, io_queue
+    if io_queue is None:
+        io_queue = Queue(maxsize=IO_QUEUE_MAX)
+    if io_thread is None or not io_thread.is_alive():
+        io_thread = threading.Thread(target=io_worker, name="io_worker", daemon=True)
+        io_thread.start()
+
+def io_worker():
+    while not stop_event.is_set():
+        try:
+            job = io_queue.get(timeout=0.1)  # type: ignore
+        except Empty:
+            continue
+        except Exception:
+            break
+        try:
+            crop_path: Path = job["crop_path"]
+            _ensure_dir(crop_path.parent)
+            cv2.imwrite(str(crop_path), job["image"])
+            with csv_lock:
+                with open(EMB_CSV, "a", newline="", encoding="utf-8") as f:
+                    csv.writer(f).writerow(job["csv_row"])
+        except Exception:
+            logger.exception("IO worker error")
+
+# ------------------ capture & processing loops ------------------
+def capture_thread_fn(cam_idx: int, rtsp_url: str):
+    q = cap_queues[cam_idx]
+    cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+    if not cap.isOpened():
+        logger.error("[cap%d] cannot open RTSP: %s", cam_idx, rtsp_url)
+        return
+    _configure_rtsp_capture(cap)
+    logger.info("[cap%d] started on %s", cam_idx, rtsp_url)
+    try:
+        while not stop_event.is_set():
+            ok, frame = _read_latest_frame(cap)
+            if not ok or frame is None:
+                time.sleep(0.01)
+                continue
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                except Exception:
+                    break
+            try:
+                q.put_nowait(frame)
+            except Exception:
+                pass
+    finally:
+        cap.release()
+        logger.info("[cap%d] stopped", cam_idx)
+
 def embedding_loop_for_cam(cam_idx: int, rtsp_url: str):
     """
-    - Detect persons via YOLO.
-    - Extract body (TorchReID, RGB) and face (InsightFace) embeddings.
-    - Link face→person (center-in-box OR IoU OR inter/face_area); write both to CSV.
-    - DB: update both embeddings (when available) with throttling.
+    Save crops only (unchanged semantics)
     """
     global current_person_id, current_person_name
 
     ensure_csv_header()
-    cam_dir = ensure_crops_dir(cam_idx)
+    start_workers_if_needed()
 
-    cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
-    if not cap.isOpened():
-        logger.error("[cam%d] cannot open RTSP: %s", cam_idx, rtsp_url)
-        return
+    user_folder = current_person_name or "unknown"
+    body_dir = _gallery_body_dir(user_folder)
+    face_dir = _gallery_face_dir(user_folder)
 
     frame_idx = 0
     logger.info("[Loop cam%d] started on %s", cam_idx, rtsp_url)
+    q = cap_queues[cam_idx]
 
     try:
         while not stop_event.is_set():
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                logger.warning("[Loop cam%d] frame read failed, breaking", cam_idx)
+            try:
+                frame = q.get(timeout=0.2)
+            except Empty:
+                continue
+            except Exception:
                 break
+            if frame is None:
+                continue
 
             frame_idx += 1
             H, W = frame.shape[:2]
             detections: List[tuple[float, float, float, float, float]] = []
+
             vis = frame.copy()
 
-            # --- YOLO detection ---
             if yolo_model is not None:
                 try:
-                    with yolo_lock:
-                        res = yolo_model(frame, conf=CONF_THRES, iou=IOU_THRES, verbose=False)
+                    with yolo_lock, torch.inference_mode():
+                        res = yolo_model.predict(
+                            frame,
+                            conf=float(CONF_THRES),
+                            iou=float(IOU_THRES),
+                            imgsz=YOLO_IMGSZ,
+                            verbose=False,
+                            device=DEVICE if torch.cuda.is_available() and ("cuda" in str(DEVICE).lower()) else "cpu",
+                        )
                     boxes = res[0].boxes if (res and len(res)) else None
                     if boxes is not None:
                         xyxy = boxes.xyxy.detach().cpu().numpy().astype(np.float32)
                         confs = boxes.conf.detach().cpu().numpy().astype(np.float32)
                         cls = boxes.cls.detach().cpu().numpy().astype(np.int32)
-
-                        keep = (cls == 0)  # person
+                        keep = (cls == 0)
                         xyxy, confs = xyxy[keep], confs[keep]
-
                         for (x1, y1, x2, y2), c in zip(xyxy, confs):
                             x1f = float(max(0, min(W - 1, x1)))
                             y1f = float(max(0, min(H - 1, y1)))
                             x2f = float(max(0, min(W - 1, x2)))
                             y2f = float(max(0, min(H - 1, y2)))
+                            if (x2f - x1f) < 4 or (y2f - y1f) < 4:
+                                continue
                             detections.append((x1f, y1f, x2f, y2f, float(c)))
                 except Exception:
                     logger.exception("[Loop cam%d] YOLO error", cam_idx)
 
-            # --- Faces on the frame (once per frame) ---
-            faces = detect_faces_and_embeddings(frame) if USE_FACE else []
+            faces = []
+            if USE_FACE and (frame_idx % max(1, FACE_EVERY) == 0):
+                faces = detect_faces_raw(frame)
 
-            # --- Embedding extraction + CSV + DB ---
-            if detections and current_person_id:
-                det_idx = 0
-                for (x1, y1, x2, y2, conf) in detections:
-                    x1i, y1i, x2i, y2i = map(int, [x1, y1, x2, y2])
-                    x1i, y1i = max(0, x1i), max(0, y1i)
-                    x2i, y2i = min(W, x2i), min(H, y2i)
-                    if x2i <= x1i or y2i <= y1i:
-                        continue
+            det_boxes_i: List[tuple[int, int, int, int, float]] = []
+            for (x1, y1, x2, y2, conf) in detections:
+                x1i, y1i, x2i, y2i = map(int, [x1, y1, x2, y2])
+                x1i, y1i = max(0, x1i), max(0, y1i)
+                x2i, y2i = min(W, x2i), min(H, y2i)
+                if x2i <= x1i or y2i <= y1i:
+                    continue
+                det_boxes_i.append((x1i, y1i, x2i, y2i, conf))
 
+                try:
                     cv2.rectangle(vis, (x1i, y1i), (x2i, y2i), (0, 255, 0), 2)
-                    label = f"{current_person_id} cam{cam_idx}"
                     cv2.putText(
-                        vis, label, (x1i, max(0, y1i - 5)),
+                        vis, f"{current_person_id or ''} cam{cam_idx}", (x1i, max(0, y1i - 5)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2,
                     )
+                except Exception:
+                    pass
 
-                    crop_bgr = frame[y1i:y2i, x1i:x2i]
-
-                    # save crop
-                    crop_filename = f"frame_{current_person_id}_{current_person_name}_{frame_idx:06d}_det{det_idx}.jpg"
-                    crop_path = cam_dir / crop_filename
-                    try:
-                        cv2.imwrite(str(crop_path), crop_bgr)
-                    except Exception:
-                        logger.exception("[Loop cam%d] crop save error", cam_idx)
-                        continue
-
-                    # Body embedding (TorchReID, RGB -> L2 float32)
-                    body_feat = None
-                    if reid_extractor is not None:
-                        try:
-                            crop_rgb = _to_rgb(crop_bgr)
-                            with reid_lock:
-                                feats = reid_extractor([crop_rgb])
-                            f0 = feats[0]
-                            if hasattr(f0, "detach"):
-                                f0 = f0.detach().cpu().numpy()
-                            elif not isinstance(f0, np.ndarray):
-                                f0 = np.asarray(f0)
-                            body_feat = l2_normalize(f0.astype(np.float32, copy=False))
-                        except Exception:
-                            logger.exception("[Loop cam%d] body embedding error", cam_idx)
-
-                    # Face embedding: robust link
-                    face_feat = None
-                    if faces:
-                        # pick best candidate based on heuristics
-                        best_idx = -1
-                        for idx, fm in enumerate(faces):
-                            fb = fm["bbox"]
-                            if link_face_to_person(fb, (x1i, y1i, x2i, y2i)):
-                                best_idx = idx
-                                break
-                        if best_idx < 0:
-                            # fallback: choose max IoU
-                            best_iou, best_idx = 0.0, -1
-                            t_xyxy = (x1i, y1i, x2i, y2i)
-                            for idx, fm in enumerate(faces):
-                                fiou = iou_xyxy(t_xyxy, fm["bbox"])
-                                if fiou > best_iou:
-                                    best_iou, best_idx = fiou, idx
-                            if best_idx >= 0 and best_iou < FACE_IOU_LINK:
-                                best_idx = -1
-                        if best_idx >= 0:
-                            face_feat = faces[best_idx]["emb"]
-
-                    # CSV strings
-                    body_str = " ".join(f"{v:.6f}" for v in (body_feat.tolist() if body_feat is not None else []))
-                    face_str = " ".join(f"{v:.6f}" for v in (face_feat.tolist() if face_feat is not None else []))
+                crop_bgr = frame[y1i:y2i, x1i:x2i]
+                if crop_bgr.size > 0:
                     ts = time.time()
-
-                    # Append to CSV
-                    with csv_lock:
-                        with open(EMB_CSV, "a", newline="", encoding="utf-8") as f:
-                            w = csv.writer(f)
-                            w.writerow(
-                                [
-                                    current_person_id,
-                                    current_person_name,
-                                    ts,
-                                    cam_idx,
-                                    frame_idx,
-                                    det_idx,
-                                    x1i,
-                                    y1i,
-                                    x2i,
-                                    y2i,
-                                    conf,
-                                    body_str,
-                                    face_str,
-                                    str(crop_path),
-                                ]
-                            )
-
-                    # DB: write both if available (throttled)
+                    fname = f"person_{_epoch_ms()}.jpg"
+                    path = body_dir / fname
+                    row = [
+                        current_person_id, current_person_name, ts,
+                        cam_idx, frame_idx, len(det_boxes_i)-1,
+                        x1i, y1i, x2i, y2i,
+                        conf,
+                        "", "", str(path), "body",
+                    ]
                     try:
-                        if _should_update_user(current_person_id):
-                            upsert_user_embeddings_by_id(
-                                current_person_id,
-                                body=(body_feat.tolist() if body_feat is not None else None),
-                                face=(face_feat.tolist() if face_feat is not None else None),
-                            )
+                        if io_queue is not None:
+                            io_queue.put_nowait({"crop_path": path, "image": crop_bgr, "csv_row": row})
                     except Exception:
-                        logger.exception(
-                            "[Loop cam%d] failed updating user embeddings for '%s'",
-                            cam_idx, current_person_id,
-                        )
+                        pass
 
-                    det_idx += 1
-            else:
-                # visualization only
-                for (x1, y1, x2, y2, _) in detections:
-                    x1i, y1i, x2i, y2i = map(int, [x1, y1, x2, y2])
-                    x1i, y1i = max(0, x1i), max(0, y1i)
-                    x2i, y2i = min(W, x2i), min(H, y2i)
-                    if x2i <= x1i or y2i <= y1i:
+            if det_boxes_i and faces:
+                ts = time.time()
+                for det_idx, (x1i, y1i, x2i, y2i, _conf) in enumerate(det_boxes_i):
+                    t_xyxy = (x1i, y1i, x2i, y2i)
+                    best_idx, best_score = -1, -1.0
+                    best_box = None
+                    for idx, fm in enumerate(faces):
+                        if link_face_to_person(fm["bbox"], t_xyxy):
+                            s = float(fm.get("score", 0.0))
+                            if s > best_score:
+                                best_score, best_idx = s, idx
+                                best_box = fm["bbox"]
+                    if best_idx < 0:
                         continue
-                    cv2.rectangle(vis, (x1i, y1i), (x2i, y2i), (0, 255, 0), 2)
-                    cv2.putText(
-                        vis, f"cam{cam_idx}", (x1i, max(0, y1i - 5)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2,
-                    )
+                    fx1, fy1, fx2, fy2 = map(int, best_box)
+                    if best_score < FACE_MIN_SCORE:
+                        continue
+                    if min(fx2 - fx1, fy2 - fy1) < FACE_MIN_SIZE:
+                        continue
 
-            # show/update
+                    body_crop = frame[y1i:y2i, x1i:x2i]
+                    if body_crop.size <= 0:
+                        continue
+                    fname = f"person_{_epoch_ms()}.jpg"
+                    path = _gallery_face_dir(current_person_name or "unknown") / fname
+                    row = [
+                        current_person_id, current_person_name, ts,
+                        cam_idx, frame_idx, det_idx,
+                        x1i, y1i, x2i, y2i,
+                        best_score,
+                        "", "", str(path), "face",
+                    ]
+                    try:
+                        if io_queue is not None:
+                            io_queue.put_nowait({"crop_path": path, "image": body_crop, "csv_row": row})
+                    except Exception:
+                        pass
+
             with frames_lock:
                 latest_frames[cam_idx] = vis
 
             if frame_idx % 50 == 0:
-                logger.info("[Loop cam%d] frame %d, detections=%d, faces=%d",
-                            cam_idx, frame_idx, len(detections), len(faces))
+                logger.info("[Loop cam%d] frame %d, persons=%d, faces=%d",
+                            cam_idx, frame_idx, len(det_boxes_i), len(faces) if faces else 0)
 
     finally:
-        cap.release()
         logger.info("[Loop cam%d] stopped", cam_idx)
 
 # ------------------ viewer ------------------
 def viewer_loop():
     logger.info("[Viewer] started")
     window_name = "Multi-RTSP Viewer"
+    window_created = False
     try:
         while not stop_event.is_set():
             with frames_lock:
@@ -1239,6 +692,13 @@ def viewer_loop():
             if not frames:
                 time.sleep(0.01)
                 continue
+
+            if not window_created:
+                try:
+                    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+                    window_created = True
+                except Exception:
+                    pass
 
             min_h = min(f.shape[0] for f in frames)
             resized = []
@@ -1255,45 +715,334 @@ def viewer_loop():
                 time.sleep(0.01)
                 continue
 
-            cv2.imshow(window_name, combined)
+            try:
+                cv2.imshow(window_name, combined)
+            except Exception:
+                window_created = False
+                time.sleep(0.01)
+                continue
+
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 logger.info("[Viewer] key pressed, stopping...")
                 stop_event.set()
                 break
 
-            time.sleep(0.01)
+            time.sleep(VIEWER_SLEEP_MS / 1000.0)
     finally:
-        cv2.destroyAllWindows()
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
         logger.info("[Viewer] stopped")
 
-# ------------------ control API ------------------
-def start_extraction(id: int):
-    """
-    Start extraction threads for all RTSP streams and viewer thread.
-    """
-    global extract_threads, viewer_thread, is_running
-    global current_person_id, current_person_name
+# ------------------ finalize / extract from folders ------------------
+def _list_images(root: Path) -> List[Path]:
+    if not root.exists():
+        return []
+    pats = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.webp")
+    files: List[Path] = []
+    for p in pats:
+        files.extend(root.glob(p))
+    return sorted(files)
 
-    if is_running:
-        logger.warning("Extraction already running for '%s'", current_person_name)
-        return {"status": "already_running", "id": current_person_id, "name": current_person_name}
+def _load_bgr(path: Path) -> Optional[np.ndarray]:
+    try:
+        img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        return img if img is not None else None
+    except Exception:
+        return None
 
-    if not RTSP_STREAMS:
-        logger.error("RTSP_STREAMS is empty.")
-        return {"status": "error", "message": "RTSP_STREAMS empty"}
+def _mean_embed(vectors: List[np.ndarray]) -> Optional[np.ndarray]:
+    if not vectors:
+        return None
+    arr = np.stack(vectors, axis=0).astype(np.float32)
+    m = np.mean(arr, axis=0)
+    return l2_normalize(m)
+
+def _count_images(user_name: str) -> Tuple[int, int]:
+    body = len(_list_images(_gallery_body_dir(user_name)))
+    face = len(_list_images(_gallery_face_dir(user_name)))
+    return body, face
+
+# ======= quality helpers =======
+def _ahash8(img_bgr: np.ndarray) -> int:
+    try:
+        g = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        g = cv2.resize(g, (8, 8), interpolation=cv2.INTER_AREA)
+        avg = float(g.mean())
+        bits = (g > avg).astype(np.uint8)
+        out = 0
+        for i, b in enumerate(bits.flatten()):
+            out |= (int(b) & 1) << i
+        return out
+    except Exception:
+        return random.getrandbits(64)
+
+def _is_blurry(img_bgr: np.ndarray, var_thr: float = 30.0) -> bool:
+    try:
+        g = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        return float(cv2.Laplacian(g, cv2.CV_64F).var()) < var_thr
+    except Exception:
+        return False
+
+def _prep_reid(img_bgr: np.ndarray) -> np.ndarray:
+    try:
+        out = cv2.resize(img_bgr, (128, 256), interpolation=cv2.INTER_LINEAR)
+    except Exception:
+        out = img_bgr
+    return _to_rgb(out)
+
+# ---------- BODY embeddings from gallery (ENSEMBLE + TTA) ----------
+def _compute_body_embedding_from_gallery(user_name: str,
+                                         on_step: Optional[Callable[[int], None]] = None
+                                         ) -> Optional[np.ndarray]:
+    if not reid_extractors:
+        logger.warning("TorchReID not available; skipping body embedding.")
+        return None
+    root = _gallery_body_dir(user_name)
+    imgs = _list_images(root)
+    if not imgs:
+        logger.warning("No BODY crops found for '%s'", user_name)
+        return None
+
+    B = 64 if (torch.cuda.is_available() and ("cuda" in str(DEVICE).lower())) else 32
+    vectors_per_image: List[np.ndarray] = []
+    seen_hashes: set[int] = set()
+
+    prepared: List[Tuple[np.ndarray, Optional[np.ndarray]]] = []
+    for p in imgs:
+        img = _load_bgr(p)
+        if img is None or img.size == 0:
+            if on_step: on_step(1)
+            continue
+        h, w = img.shape[:2]
+        if min(h, w) < 32 or _is_blurry(img):
+            if on_step: on_step(1)
+            continue
+        hval = _ahash8(img)
+        if hval in seen_hashes:
+            if on_step: on_step(1)
+            continue
+        seen_hashes.add(hval)
+
+        rgb = _prep_reid(img)
+        rgb_flip = cv2.flip(rgb, 1) if BODY_TTA_FLIP else None
+        prepared.append((rgb, rgb_flip))
+        if on_step: on_step(1)
+
+    if not prepared:
+        logger.warning("No valid BODY crops for '%s'", user_name)
+        return None
+
+    per_model_embs: List[List[np.ndarray]] = [ [] for _ in reid_extractors ]
+
+    for midx, ext in enumerate(reid_extractors):
+        batch_imgs: List[np.ndarray] = []
+        idx_map: List[Tuple[int, int]] = []
+        for i, (orig, flip) in enumerate(prepared):
+            batch_imgs.append(orig); idx_map.append((i, 0))
+            if flip is not None:
+                batch_imgs.append(flip); idx_map.append((i, 1))
+
+        feats_norm: List[np.ndarray] = []
+        for start in range(0, len(batch_imgs), B):
+            chunk = batch_imgs[start:start+B]
+            try:
+                with reid_lock, torch.inference_mode():
+                    feats = ext(chunk)
+                for f in feats:
+                    f = f.detach().cpu().numpy() if hasattr(f, "detach") else np.asarray(f)
+                    f512 = _as_512f(f)
+                    feats_norm.append(f512 if f512 is not None else np.zeros((EXPECTED_EMBED_DIM,), np.float32))
+            except Exception:
+                logger.exception("TorchReID batch failed (model=%s)", REID_MODELS[midx])
+                feats_norm.extend([np.zeros((EXPECTED_EMBED_DIM,), np.float32) for _ in chunk])
+
+        img_accum = [ [] for _ in prepared ]
+        for (img_i, _tta_i), feat in zip(idx_map, feats_norm):
+            img_accum[img_i].append(feat)
+        fused = [ l2_normalize(np.mean(np.stack(v, axis=0), axis=0)) if v else np.zeros((EXPECTED_EMBED_DIM,), np.float32)
+                  for v in img_accum ]
+        per_model_embs[midx] = fused
+
+    for i in range(len(prepared)):
+        parts = [ per_model_embs[m][i] for m in range(len(reid_extractors)) ]
+        fused_img = l2_normalize(np.mean(np.stack(parts, axis=0), axis=0))
+        vectors_per_image.append(fused_img)
+
+    return _mean_embed(vectors_per_image)
+
+# ---------- FACE embeddings from gallery (TTA) ----------
+def _compute_face_embedding_from_gallery(user_name: str,
+                                         on_step: Optional[Callable[[int], None]] = None
+                                         ) -> Optional[np.ndarray]:
+    if face_app is None:
+        logger.warning("InsightFace not available; skipping face embedding.")
+        return None
+    root = _gallery_face_dir(user_name)
+    imgs = _list_images(root)
+    if not imgs:
+        logger.warning("No FACE crops found for '%s'", user_name)
+        return None
+
+    vectors: List[np.ndarray] = []
+    seen_hashes: set[int] = set()
+    MAX_SIDE = 640
+    MIN_BODY_SIDE = 40
+
+    for p in imgs:
+        img = _load_bgr(p)
+        if img is None or img.size == 0:
+            if on_step: on_step(1); continue
+        h, w = img.shape[:2]
+        if min(h, w) < MIN_BODY_SIDE or _is_blurry(img):
+            if on_step: on_step(1); continue
+
+        hval = _ahash8(img)
+        if hval in seen_hashes:
+            if on_step: on_step(1); continue
+        seen_hashes.add(hval)
+
+        if max(h, w) > MAX_SIDE:
+            scale = MAX_SIDE / float(max(h, w))
+            img_proc = cv2.resize(img, (max(1, int(w*scale)), max(1, int(h*scale))), interpolation=cv2.INTER_LINEAR)
+        else:
+            img_proc = img
+
+        def _best_face(bgr_img) -> Optional[np.ndarray]:
+            try:
+                faces = face_app.get(np.ascontiguousarray(bgr_img))
+            except Exception:
+                faces = []
+            best, best_score = None, -1.0
+            for f in safe_iter_faces(faces):
+                bbox = getattr(f, "bbox", None)
+                if bbox is None: continue
+                b = np.asarray(bbox).reshape(-1)
+                if b.size < 4: continue
+                x1, y1, x2, y2 = b[:4].astype(float)
+                area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+                score = float(getattr(f, "det_score", 0.0))
+                ranking = score * (area ** 0.5)
+                if ranking > best_score:
+                    best, best_score = f, ranking
+            if best is None:
+                return None
+            det_score = float(getattr(best, "det_score", 0.0))
+            if det_score < FACE_MIN_SCORE:
+                return None
+            emb = extract_face_embedding(best)
+            return _as_512f(emb)
+
+        e0 = _best_face(img_proc)
+        e1 = None
+        if FACE_TTA_FLIP:
+            try:
+                e1 = _best_face(cv2.flip(img_proc, 1))
+            except Exception:
+                e1 = None
+
+        feats = [e for e in (e0, e1) if e is not None]
+        if feats:
+            fused = l2_normalize(np.mean(np.stack(feats, axis=0), axis=0))
+            vectors.append(fused)
+
+        if on_step: on_step(1)
+
+    if not vectors:
+        logger.warning("No valid FACE embeddings for '%s'", user_name)
+        return None
+    return _mean_embed(vectors)
+
+def _update_db_embeddings(user_id: int,
+                          body_emb: Optional[np.ndarray],
+                          face_emb: Optional[np.ndarray]) -> Dict[str, object]:
+    session = get_session()
+    try:
+        user = session.query(User).filter(User.id == user_id).first()
+        if not user:
+            logger.warning("User ID %s not found. Skipping DB update.", user_id)
+            return {"status": "error", "message": "user not found"}
+
+        changed = False
+        if body_emb is not None:
+            user.body_embedding = body_emb.tolist()  # pgvector expects list
+            changed = True
+        if face_emb is not None:
+            user.face_embedding = face_emb.tolist()
+            changed = True
+        if changed:
+            user.last_embedding_update_ts = datetime.now(timezone.utc)
+            session.commit()
+            logger.info("DB updated: user=%s body=%s face=%s",
+                        user_id, body_emb is not None, face_emb is not None)
+            return {"status": "ok", "body": body_emb is not None, "face": face_emb is not None}
+        else:
+            logger.info("No embeddings to update for user=%s", user_id)
+            return {"status": "no_embeddings"}
+    except Exception:
+        session.rollback()
+        logger.exception("DB error on update")
+        return {"status": "error", "message": "db error"}
+    finally:
+        session.close()
+
+# ---- Background extraction worker (runs on POST /extract) ----
+def _extract_worker(user_id: int, user_name: str):
+    try:
+        _progress_reset(user_id, user_name)
+        _progress_set(user_id, stage="scanning", message="Counting images...")
+        total_body, total_face = _count_images(user_name)
+        if total_body + total_face == 0:
+            _progress_set(user_id, total_body=0, total_face=0, percent=100,
+                          stage="done", message="No images to process")
+            return
+
+        _progress_set(user_id, total_body=total_body, total_face=total_face,
+                      done_body=0, done_face=0, percent=0)
+
+        body_emb = None
+        if total_body > 0 and reid_extractors:
+            _progress_set(user_id, stage="embedding_body", message=f"Processing body ({total_body})")
+            def on_body(n: int):
+                st = get_progress_for_user(user_id)
+                _progress_set(user_id, done_body=int(st["done_body"]) + int(n))
+            body_emb = _compute_body_embedding_from_gallery(user_name, on_step=on_body)
+        else:
+            _progress_set(user_id, message="Skipping body (no images or model unavailable)")
+
+        face_emb = None
+        if total_face > 0 and face_app is not None:
+            _progress_set(user_id, stage="embedding_face", message=f"Processing face ({total_face})")
+            def on_face(n: int):
+                st = get_progress_for_user(user_id)
+                _progress_set(user_id, done_face=int(st["done_face"]) + int(n))
+            face_emb = _compute_face_embedding_from_gallery(user_name, on_step=on_face)
+        else:
+            _progress_set(user_id, message="Skipping face (no images or model unavailable)")
+
+        res = _update_db_embeddings(user_id, body_emb, face_emb)
+        status = str(res.get("status", "unknown"))
+        if status == "ok":
+            _progress_set(user_id, stage="done", message="Embeddings saved", percent=100)
+        else:
+            _progress_set(user_id, stage="done", message=status, percent=100)
+    except Exception as e:
+        logger.exception("extract worker failed")
+        _progress_set(user_id, stage="error", message=f"error: {e}")
+
+def extract_embeddings_async(user_id: int) -> Dict[str, object]:
+    """Kick off background extraction from saved galleries with progress reporting."""
+    if not reid_extractors or (USE_FACE and face_app is None):
+        init_models()
 
     session = get_session()
     try:
-        user = session.query(User).filter(User.id == id).first()
+        user = session.query(User).filter(User.id == user_id).first()
         if not user:
-            logger.error("User with id %d not found. Extraction aborted.", id)
-            return {"status": "error", "message": f"user id {id} not found"}
-
-        current_person_id = id
-        current_person_name = user.name
-
-        logger.info("Extraction will run for user: id=%d name='%s'", current_person_id, current_person_name)
+            return {"status": "error", "message": f"user id {user_id} not found"}
+        user_name = user.name
     except Exception:
         session.rollback()
         logger.exception("DB error during user lookup.")
@@ -1301,59 +1050,153 @@ def start_extraction(id: int):
     finally:
         session.close()
 
-    stop_event.clear()
-    extract_threads = {}
-    with frames_lock:
-        latest_frames.clear()
+    t = threading.Thread(target=_extract_worker, args=(user_id, user_name), daemon=True, name=f"extract-{user_id}")
+    t.start()
+    return {"status": "started", "id": user_id, "name": user_name}
 
-    # init models if not already
-    if yolo_model is None or (USE_FACE and face_app is None) or (reid_extractor is None):
+# ---- NEW: synchronous extraction (immediate DB write) ----
+def extract_embeddings_sync(user_id: int) -> Dict[str, object]:
+    """Run extraction now and write embeddings to DB before returning."""
+    if not reid_extractors or (USE_FACE and face_app is None):
         init_models()
 
-    for idx, url in enumerate(RTSP_STREAMS):
-        t = threading.Thread(target=embedding_loop_for_cam, args=(idx, url), daemon=True)
-        extract_threads[idx] = t
-        t.start()
+    session = get_session()
+    try:
+        user = session.query(User).filter(User.id == user_id).first()
+        if not user:
+            return {"status": "error", "message": f"user id {user_id} not found"}
+        user_name = user.name
+    except Exception:
+        session.rollback()
+        logger.exception("DB error during user lookup.")
+        return {"status": "error", "message": "DB error"}
+    finally:
+        session.close()
 
-    viewer_thread = threading.Thread(target=viewer_loop, daemon=True)
-    viewer_thread.start()
+    _progress_reset(user_id, user_name)
+    _progress_set(user_id, stage="scanning", message="Counting images...")
+    total_body, total_face = _count_images(user_name)
+    _progress_set(user_id, total_body=total_body, total_face=total_face)
+
+    body_emb = _compute_body_embedding_from_gallery(user_name, on_step=lambda n: None) if total_body > 0 else None
+    face_emb = _compute_face_embedding_from_gallery(user_name, on_step=lambda n: None) if total_face > 0 else None
+    res = _update_db_embeddings(user_id, body_emb, face_emb)
+    _progress_set(user_id, stage="done", percent=100, message=res.get("status", "done"))
+    return res
+
+# ------------------ control API ------------------
+def start_extraction(user_id: int, show_viewer: bool = True) -> dict:
+    """Start capture+crop across all RTSP streams for the given user_id."""
+    global is_running, current_person_id, current_person_name
+    global viewer_thread
+
+    if is_running:
+        return {"status": "ok", "message": "already running", "num_cams": len(RTSP_STREAMS),
+                "id": current_person_id, "name": current_person_name}
+
+    session = get_session()
+    try:
+        user = session.query(User).filter(User.id == int(user_id)).first()
+        if not user:
+            return {"status": "error", "message": f"user id {user_id} not found"}
+        user_name = str(user.name)
+    except Exception:
+        session.rollback()
+        logger.exception("DB error during user lookup (start_extraction).")
+        return {"status": "error", "message": "DB error"}
+    finally:
+        session.close()
+
+    if yolo_model is None or (USE_FACE and face_app is None):
+        init_models()
+
+    stop_event.clear()
+    with frames_lock:
+        latest_frames.clear()
+    for d in (capture_threads, extract_threads, cap_queues):
+        d.clear()
+
+    _progress_reset(int(user_id), user_name)
+    _progress_set(int(user_id), stage="starting", message="initializing")
+
+    current_person_id = int(user_id)
+    current_person_name = user_name
+
+    start_workers_if_needed()
+
+    for cam_idx, rtsp_url in enumerate(RTSP_STREAMS):
+        cap_queues[cam_idx] = Queue(maxsize=CAP_QUEUE_MAX)
+        t_cap = threading.Thread(target=capture_thread_fn, name=f"cap_{cam_idx}",
+                                 args=(cam_idx, rtsp_url), daemon=True)
+        t_ext = threading.Thread(target=embedding_loop_for_cam, name=f"ext_{cam_idx}",
+                                 args=(cam_idx, rtsp_url), daemon=True)
+        capture_threads[cam_idx] = t_cap
+        extract_threads[cam_idx] = t_ext
+        t_cap.start()
+        t_ext.start()
+
+    if show_viewer and (viewer_thread is None or not viewer_thread.is_alive()):
+        viewer_thread = threading.Thread(target=viewer_loop, name="viewer", daemon=True)
+        viewer_thread.start()
 
     is_running = True
-    return {
-        "status": "started",
-        "num_cams": len(RTSP_STREAMS),
-        "id": current_person_id,
-        "name": current_person_name,
-    }
+    _progress_set(int(user_id), stage="running", message="processing")
+    logger.info("Extraction started for user_id=%s name=%s on %d stream(s)",
+                user_id, user_name, len(RTSP_STREAMS))
 
-def stop_extraction():
-    """
-    Stop extraction and viewer threads gracefully.
-    """
-    global extract_threads, is_running, viewer_thread, current_person_id
+    return {"status": "ok", "message": "started", "num_cams": len(RTSP_STREAMS),
+            "id": int(user_id), "name": user_name}
 
-    if not is_running:
-        logger.info("stop_extraction called but extract_service is not running.")
-        return {"status": "not_running"}
+def stop_extraction(reason: str = "user") -> dict:
+    """Gracefully stop all threads and reset state. Then auto-extract & store embeddings."""
+    global is_running, current_person_id, current_person_name
+    try:
+        # snapshot the user before wiping globals
+        uid_snapshot = current_person_id
+        uname_snapshot = current_person_name
 
-    stop_event.set()
-    for idx, t in extract_threads.items():
-        try:
-            t.join(timeout=10.0)
-        except Exception:
-            logger.exception("Error joining thread for cam %d", idx)
+        stop_event.set()
 
-    if viewer_thread is not None:
-        try:
-            viewer_thread.join(timeout=10.0)
-        except Exception:
-            logger.exception("Error joining viewer thread")
+        for d in (capture_threads, extract_threads):
+            for idx, th in list(d.items()):
+                try:
+                    th.join(timeout=1.5)
+                except Exception:
+                    pass
 
-    extract_threads = {}
-    is_running = False
-    current_person_id = None
-    logger.info("Extraction stopped.")
-    return {"status": "stopped"}
+        with frames_lock:
+            latest_frames.clear()
+        capture_threads.clear()
+        extract_threads.clear()
+        cap_queues.clear()
+
+        if viewer_thread is not None and viewer_thread.is_alive():
+            try:
+                pass
+            except Exception:
+                pass
+
+        is_running = False
+        logger.info("Extraction stopped (%s).", reason)
+
+        # --------- NEW: auto-trigger background embedding write to DB ----------
+        if uid_snapshot is not None:
+            if not reid_extractors or (USE_FACE and face_app is None):
+                init_models()
+            # spawn a detached worker to compute & store embeddings for the just-stopped user
+            threading.Thread(
+                target=_extract_worker,
+                args=(int(uid_snapshot), uname_snapshot or "unknown"),
+                name=f"auto-extract-{uid_snapshot}",
+                daemon=True,
+            ).start()
+            logger.info("Auto-extract triggered for user_id=%s after stop.", uid_snapshot)
+        # ----------------------------------------------------------------------
+
+        return {"status": "ok", "message": f"stopped ({reason})"}
+    finally:
+        current_person_id = None
+        current_person_name = None
 
 def remove_embeddings(id: int):
     """Remove stored embeddings (body + face)."""
@@ -1367,9 +1210,8 @@ def remove_embeddings(id: int):
         user.face_embedding = None
         user.last_embedding_update_ts = datetime.now(timezone.utc)
         session.commit()
-        session.refresh(user)
         logger.warning("Embeddings removed for user id=%d", id)
-        return user
+        return {"status": "ok", "id": id}
     except Exception:
         session.rollback()
         logger.exception("remove embeddings: DB error during user lookup.")
@@ -1385,3 +1227,6 @@ def get_status():
         "rtsp_streams": RTSP_STREAMS,
         "id": current_person_id,
     }
+
+
+
