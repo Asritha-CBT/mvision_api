@@ -1,7 +1,11 @@
 # app/routes/embeddings.py
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel 
-from mvision.services import extract_service
+from mvision.services import extract_service 
+from mvision.db.database import get_db
+from sqlalchemy.orm import Session
+from sqlalchemy.sql import func
+from mvision.db.models import CameraCategory
 
 router = APIRouter(prefix="/api/extraction", tags=["extraction"])
 
@@ -9,6 +13,10 @@ router = APIRouter(prefix="/api/extraction", tags=["extraction"])
 class StartRequest(BaseModel):
     id: int
 
+
+@router.get("/categories")
+def get_categories(db: Session = Depends(get_db)):
+    return db.query(CameraCategory).all()
 
 @router.post("/start")
 def start(req: StartRequest):
