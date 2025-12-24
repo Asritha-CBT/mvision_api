@@ -4,13 +4,13 @@ import os
 
 # --- EDIT / override with env vars ---
 RTSP_STREAMS = [
-    "rtsp://admin:rolex%40123@192.168.1.112:554/Streaming/channels/101",
+    "rtsp://admin:rolex%40123@192.168.1.113:554/Streaming/channels/101",
 ]
 
 
 YOLO_WEIGHTS = os.getenv("YOLO_WEIGHTS", "yolov8n.pt")
 DEVICE = os.getenv("DEVICE", "cuda:0")
-CONF_THRES = float(os.getenv("CONF_THRES", 0.30))
+CONF_THRES = float(os.getenv("CONF_THRES", 0.80))
 IOU_THRES = float(os.getenv("IOU_THRES", 0.40))
 
 
@@ -18,7 +18,7 @@ EMB_CSV = os.getenv("EMB_CSV", "live_embeddings_multi.csv")
 CROPS_ROOT = os.getenv("CROPS_ROOT", "crops")
 EMB_DB_URL = os.getenv(
     "DATABASE_URL",
-    "postgresql://postgres:postgrey1234$$@localhost:5432/m_vision",
+    "postgresql://postgres:postgrey1234$$@192.168.1.7:5432/m_vision",
 )
 
 
