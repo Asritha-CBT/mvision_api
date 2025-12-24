@@ -1,10 +1,15 @@
-from __future__ import annotations
-
-from fastapi import APIRouter, HTTPException
+ 
+# app/routes/embeddings.py
+from fastapi import APIRouter, Depends, HTTPException 
+from mvision.services import extract_service 
+from mvision.db.database import get_db
+from sqlalchemy.orm import Session
+from sqlalchemy.sql import func
+from mvision.db.models import CameraCategory 
+from __future__ import annotations 
 from pydantic import BaseModel, Field, conint
 from typing import Optional, List, Dict, Any
-
-from mvision.services import extract_service
+ 
 
 router = APIRouter(prefix="/api/extraction", tags=["extraction"])
 
@@ -72,6 +77,17 @@ def start(req: StartRequest) -> StartResponse:
         name=req.name,
     )
 
+@router.get("/categories")
+def get_categories(db: Session = Depends(get_db)):
+    return db.query(CameraCategory).all()
+
+@router.post("/start")
+def start(req: StartRequest):
+    """
+    Start background extraction for all RTSP streams.
+    Payload: { "id": 123 }
+    """
+    return extract_service.start_extraction(req.id)
 @router.post("/stop", response_model=StopResponse)
 def stop() -> StopResponse:
     """Stop background capture/embedding."""
