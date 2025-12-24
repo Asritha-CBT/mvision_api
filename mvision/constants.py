@@ -27,3 +27,10 @@ EMB_DB_URL = os.getenv(
 
 # ensure crops dir exists by default
 Path(CROPS_ROOT).mkdir(parents=True, exist_ok=True)
+
+CAMERAS = [
+    {"id": "CAM_01", "name": "Entrance Camera"},
+    {"id": "CAM_02", "name": "Lobby Camera"},
+    {"id": "CAM_03", "name": "Parking Camera"},
+    {"id": "CAM_04", "name": "Office Floor Camera"},
+]
