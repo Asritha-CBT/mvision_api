@@ -39,7 +39,7 @@ class User(Base):
     body_embedding = Column(Vector(512), nullable=True)
     face_embedding = Column(Vector(512), nullable=True)
     last_embedding_update_ts = Column(DateTime(timezone=True), nullable=True)
-    category_id = Column(Integer, ForeignKey("camera_category.id"), nullable=False)
+    category_id = Column(Integer, ForeignKey("camera_category.id"), nullable=True)
     category = relationship("CameraCategory", back_populates="users")
     status = Column(String, default="active")
 

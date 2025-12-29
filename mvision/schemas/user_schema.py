@@ -12,6 +12,13 @@ class UserRegister(BaseModel):
             raise ValueError("cannot be empty")
         return value
 
+class CategoryResponse(BaseModel):
+    id: int
+    name: str
+    description: Optional[str] = None
+
+    class Config:
+        from_attributes = True
 
 class UserResponse(BaseModel):
     id: int
@@ -19,6 +26,8 @@ class UserResponse(BaseModel):
     department: Optional[str] = None
     body_embedding: Optional[List[float]] = None   # <-- pgvector field
     face_embedding: Optional[List[float]] = None   # <-- pgvector field
+    category_id: Optional[int] = None
+    category: Optional[CategoryResponse] = None  # nested object
 
     class Config:
         from_attributes = True
@@ -26,18 +35,7 @@ class UserResponse(BaseModel):
 
 class EmbeddingUpdate(BaseModel):
     body_embedding: Optional[List[float]] = None
-    face_embedding: Optional[List[float]] = None
-
-class UserResponse(BaseModel):
-    id: int
-    name: str
-    department: Optional[str] = None
-    body_embedding: Optional[List[float]] = None  
-    face_embedding: Optional[List[float]] = None  
-
-    class Config:
-        from_attributes = True
-
+    face_embedding: Optional[List[float]] = None 
 
 class EmbeddingUpdate(BaseModel):
     body_embedding: Optional[List[float]] = None

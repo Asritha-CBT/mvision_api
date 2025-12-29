@@ -17,17 +17,20 @@ router = APIRouter(prefix="/api/extraction", tags=["extraction"])
 class StartRequest(BaseModel):
     id: conint(gt=0) = Field(..., description="User ID to capture for")
     name: str = Field("unknown", description="User name for folder/DB labeling")
+    category_id: Optional[int] = Field(None, description="CameraCategory.id to store with embeddings/user")
 
 class StartResponse(BaseModel):
     status: str
     num_cams: int
     id: Optional[int]
     name: Optional[str]
+    category_id: Optional[int] = None
 
 class ExtractStartResponse(BaseModel):
     status: str
     id: int
     name: str
+    category_id: Optional[int] = None
 
 class ProgressResponse(BaseModel):
     id: int
@@ -57,7 +60,7 @@ def start(req: StartRequest) -> StartResponse:
         raise HTTPException(status_code=501, detail="start_extraction is not implemented in extract_service")
 
     try:
-        res = extract_service.start_extraction(req.id, req.name)  # type: ignore
+        res = extract_service.start_extraction(req.id, req.name, category_id=req.category_id)  # type: ignore
     except TypeError as e:
         raise HTTPException(status_code=500, detail=f"start_extraction signature mismatch: {e}") from e
     except Exception as e:
@@ -75,19 +78,13 @@ def start(req: StartRequest) -> StartResponse:
         num_cams=num_cams,
         id=req.id,
         name=req.name,
+        category_id=req.category_id,
     )
 
 @router.get("/categories")
 def get_categories(db: Session = Depends(get_db)):
     return db.query(CameraCategory).all()
-
-@router.post("/start")
-def start(req: StartRequest):
-    """
-    Start background extraction for all RTSP streams.
-    Payload: { "id": 123 }
-    """
-    return extract_service.start_extraction(req.id)
+ 
 @router.post("/stop", response_model=StopResponse)
 def stop() -> StopResponse:
     """Stop background capture/embedding."""
@@ -112,8 +109,8 @@ def extract_embeddings(req: StartRequest) -> ExtractStartResponse:
     if not hasattr(extract_service, "extract_embeddings_async"):
         raise HTTPException(status_code=501, detail="extract_embeddings_async is not implemented in extract_service")
 
-    try:
-        res = extract_service.extract_embeddings_async(req.id)  # type: ignore
+    try: 
+        res = extract_service.extract_embeddings_async(req.id, req.category_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"extract_embeddings failed: {e}") from e
 
@@ -126,6 +123,7 @@ def extract_embeddings(req: StartRequest) -> ExtractStartResponse:
         status=str(res.get("status", "unknown")),
         id=int(res.get("id", req.id)),
         name=str(res.get("name", req.name)),
+        category_id=req.category_id,
     )
 
 @router.get("/progress/{id}", response_model=ProgressResponse)
