@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.sql import func
 from mvision.db.database import get_db
 from mvision.schemas import user_schema
@@ -12,7 +12,7 @@ router = APIRouter()
 # ---------------- GET ALL USERS ----------------
 @router.get("/users", response_model=list[user_schema.UserResponse])
 def get_all_users(db: Session = Depends(get_db)):
-    users = db.query(models.User).all()
+    users = db.query(models.User).options(joinedload(models.User.category)).all()
     return users
 
 

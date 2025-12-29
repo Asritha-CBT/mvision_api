@@ -131,6 +131,7 @@ stop_event = threading.Event()
 is_running = False
 current_person_id: Optional[int] = None
 current_person_name: Optional[str] = None
+current_category_id: Optional[int] = None
 
 # ---- extraction progress state (for /extract) ----
 progress_lock = threading.Lock()
@@ -957,7 +958,8 @@ def _compute_face_embedding_from_gallery(user_name: str,
 
 def _update_db_embeddings(user_id: int,
                           body_emb: Optional[np.ndarray],
-                          face_emb: Optional[np.ndarray]) -> Dict[str, object]:
+                          face_emb: Optional[np.ndarray],
+                          category_id: Optional[int] = None) -> Dict[str, object]:
     session = get_session()
     try:
         user = session.query(User).filter(User.id == user_id).first()
@@ -966,6 +968,14 @@ def _update_db_embeddings(user_id: int,
             return {"status": "error", "message": "user not found"}
 
         changed = False
+        if category_id is not None:
+            try:
+                cid = int(category_id)
+                if getattr(user, "category_id", None) != cid:
+                    user.category_id = cid
+                    changed = True
+            except Exception:
+                logger.warning("Invalid category_id=%r for user_id=%s (skipping).", category_id, user_id)
         if body_emb is not None:
             user.body_embedding = body_emb.tolist()  # pgvector expects list
             changed = True
@@ -975,9 +985,9 @@ def _update_db_embeddings(user_id: int,
         if changed:
             user.last_embedding_update_ts = datetime.now(timezone.utc)
             session.commit()
-            logger.info("DB updated: user=%s body=%s face=%s",
-                        user_id, body_emb is not None, face_emb is not None)
-            return {"status": "ok", "body": body_emb is not None, "face": face_emb is not None}
+            logger.info("DB updated: user=%s category_id=%s body=%s face=%s",
+                                    user_id, getattr(user, "category_id", None), body_emb is not None, face_emb is not None)
+            return {"status": "ok", "body": body_emb is not None, "face": face_emb is not None,"category_id": getattr(user, "category_id", None),}
         else:
             logger.info("No embeddings to update for user=%s", user_id)
             return {"status": "no_embeddings"}
@@ -989,105 +999,136 @@ def _update_db_embeddings(user_id: int,
         session.close()
 
 # ---- Background extraction worker (runs on POST /extract) ----
-def _extract_worker(user_id: int, user_name: str):
+def _extract_worker(user_id: int, user_name: str, category_id: Optional[int] = None):
     try:
         _progress_reset(user_id, user_name)
         _progress_set(user_id, stage="scanning", message="Counting images...")
+
         total_body, total_face = _count_images(user_name)
         if total_body + total_face == 0:
-            _progress_set(user_id, total_body=0, total_face=0, percent=100,
-                          stage="done", message="No images to process")
+            _progress_set(
+                user_id,
+                total_body=0,
+                total_face=0,
+                done_body=0,
+                done_face=0,
+                percent=100,
+                stage="done",
+                message="No images to process",
+            )
             return
 
-        _progress_set(user_id, total_body=total_body, total_face=total_face,
-                      done_body=0, done_face=0, percent=0)
+        _progress_set(
+            user_id,
+            total_body=total_body,
+            total_face=total_face,
+            done_body=0,
+            done_face=0,
+            percent=0,
+            stage="scanning",
+            message="Starting...",
+        )
 
         body_emb = None
         if total_body > 0 and reid_extractors:
             _progress_set(user_id, stage="embedding_body", message=f"Processing body ({total_body})")
             def on_body(n: int):
-                st = get_progress_for_user(user_id)
-                _progress_set(user_id, done_body=int(st["done_body"]) + int(n))
+                st = get_progress_for_user(user_id) or {}
+                _progress_set(user_id, done_body=int(st.get("done_body", 0)) + int(n))
             body_emb = _compute_body_embedding_from_gallery(user_name, on_step=on_body)
         else:
-            _progress_set(user_id, message="Skipping body (no images or model unavailable)")
+            _progress_set(user_id, stage="embedding_body", message="Skipping body (no images or model unavailable)")
 
         face_emb = None
         if total_face > 0 and face_app is not None:
             _progress_set(user_id, stage="embedding_face", message=f"Processing face ({total_face})")
             def on_face(n: int):
-                st = get_progress_for_user(user_id)
-                _progress_set(user_id, done_face=int(st["done_face"]) + int(n))
+                st = get_progress_for_user(user_id) or {}
+                _progress_set(user_id, done_face=int(st.get("done_face", 0)) + int(n))
             face_emb = _compute_face_embedding_from_gallery(user_name, on_step=on_face)
         else:
-            _progress_set(user_id, message="Skipping face (no images or model unavailable)")
+            _progress_set(user_id, stage="embedding_face", message="Skipping face (no images or model unavailable)")
 
-        res = _update_db_embeddings(user_id, body_emb, face_emb)
+        # NEW: show DB commit stage BEFORE the commit happens
+        _progress_set(user_id, stage="db_commit", percent=95, message="Saving to DB...")
+
+        res = _update_db_embeddings(user_id, body_emb, face_emb, category_id=category_id)
+
         status = str(res.get("status", "unknown"))
         if status == "ok":
-            _progress_set(user_id, stage="done", message="Embeddings saved", percent=100)
+            _progress_set(user_id, stage="done", message="Embeddings + category saved", percent=100)
         else:
-            _progress_set(user_id, stage="done", message=status, percent=100)
+            # use error stage so UI can show failure
+            _progress_set(user_id, stage="error", message=f"DB update failed: {status}", percent=0)
+
     except Exception as e:
         logger.exception("extract worker failed")
-        _progress_set(user_id, stage="error", message=f"error: {e}")
+        _progress_set(user_id, stage="error", message=f"error: {e}", percent=0)
 
-def extract_embeddings_async(user_id: int) -> Dict[str, object]:
+
+_MODEL_LOCK = threading.Lock()
+_RUNNING = set()
+_RUNNING_LOCK = threading.Lock()
+
+def ensure_models():
+    global reid_extractors, face_app
+    if reid_extractors and (not USE_FACE or face_app is not None):
+        return
+    with _MODEL_LOCK:
+        if reid_extractors and (not USE_FACE or face_app is not None):
+            return
+        init_models()
+
+def extract_embeddings_async(user_id: int, category_id: Optional[int] = None) -> Dict[str, object]:
     """Kick off background extraction from saved galleries with progress reporting."""
-    if not reid_extractors or (USE_FACE and face_app is None):
-        init_models()
+    ensure_models()
+
+    # prevent duplicate jobs
+    with _RUNNING_LOCK:
+        if user_id in _RUNNING:
+            st = get_progress_for_user(user_id) or {}
+            return {"status": "started", "id": user_id, "name": st.get("name", ""), "category_id": category_id}
+
+        _RUNNING.add(user_id)
 
     session = get_session()
     try:
         user = session.query(User).filter(User.id == user_id).first()
         if not user:
+            with _RUNNING_LOCK:
+                _RUNNING.discard(user_id)
             return {"status": "error", "message": f"user id {user_id} not found"}
+
         user_name = user.name
+        cat_id = int(category_id) if category_id is not None else getattr(user, "category_id", None)
+
     except Exception:
         session.rollback()
         logger.exception("DB error during user lookup.")
+        with _RUNNING_LOCK:
+            _RUNNING.discard(user_id)
         return {"status": "error", "message": "DB error"}
     finally:
         session.close()
 
-    t = threading.Thread(target=_extract_worker, args=(user_id, user_name), daemon=True, name=f"extract-{user_id}")
+    _progress_set(user_id, stage="queued", percent=1, message="Queued...")
+
+    def _run():
+        try:
+            _extract_worker(user_id, user_name, cat_id)
+        finally:
+            with _RUNNING_LOCK:
+                _RUNNING.discard(user_id)
+
+    t = threading.Thread(target=_run, daemon=True, name=f"extract-{user_id}")
     t.start()
-    return {"status": "started", "id": user_id, "name": user_name}
 
-# ---- NEW: synchronous extraction (immediate DB write) ----
-def extract_embeddings_sync(user_id: int) -> Dict[str, object]:
-    """Run extraction now and write embeddings to DB before returning."""
-    if not reid_extractors or (USE_FACE and face_app is None):
-        init_models()
-
-    session = get_session()
-    try:
-        user = session.query(User).filter(User.id == user_id).first()
-        if not user:
-            return {"status": "error", "message": f"user id {user_id} not found"}
-        user_name = user.name
-    except Exception:
-        session.rollback()
-        logger.exception("DB error during user lookup.")
-        return {"status": "error", "message": "DB error"}
-    finally:
-        session.close()
-
-    _progress_reset(user_id, user_name)
-    _progress_set(user_id, stage="scanning", message="Counting images...")
-    total_body, total_face = _count_images(user_name)
-    _progress_set(user_id, total_body=total_body, total_face=total_face)
-
-    body_emb = _compute_body_embedding_from_gallery(user_name, on_step=lambda n: None) if total_body > 0 else None
-    face_emb = _compute_face_embedding_from_gallery(user_name, on_step=lambda n: None) if total_face > 0 else None
-    res = _update_db_embeddings(user_id, body_emb, face_emb)
-    _progress_set(user_id, stage="done", percent=100, message=res.get("status", "done"))
-    return res
-
+    return {"status": "started", "id": user_id, "name": user_name, "category_id": cat_id}
+ 
 # ------------------ control API ------------------
-def start_extraction(user_id: int, show_viewer: bool = True) -> dict:
+def start_extraction(user_id: int, show_viewer: bool = True, category_id: Optional[int] = None) -> dict:
     """Start capture+crop across all RTSP streams for the given user_id."""
-    global is_running, current_person_id, current_person_name
+    global is_running, current_person_id, current_person_name, current_category_id
     global viewer_thread
 
     if is_running:
@@ -1100,6 +1141,14 @@ def start_extraction(user_id: int, show_viewer: bool = True) -> dict:
         if not user:
             return {"status": "error", "message": f"user id {user_id} not found"}
         user_name = str(user.name)
+        # NEW: store requested category_id (optional)
+        if category_id is not None:
+            try:
+                user.category_id = int(category_id)
+                session.commit()
+            except Exception:
+                session.rollback()
+                logger.exception("Failed updating category_id for user_id=%s", user_id)
     except Exception:
         session.rollback()
         logger.exception("DB error during user lookup (start_extraction).")
@@ -1121,6 +1170,7 @@ def start_extraction(user_id: int, show_viewer: bool = True) -> dict:
 
     current_person_id = int(user_id)
     current_person_name = user_name
+    current_category_id = int(category_id) if category_id is not None else getattr(user, "category_id", None)
 
     start_workers_if_needed()
 
@@ -1148,12 +1198,13 @@ def start_extraction(user_id: int, show_viewer: bool = True) -> dict:
             "id": int(user_id), "name": user_name}
 
 def stop_extraction(reason: str = "user") -> dict:
-    """Gracefully stop all threads and reset state. Then auto-extract & store embeddings."""
-    global is_running, current_person_id, current_person_name
+    """Gracefully stop all threads and reset state. Then auto-extract & store embeddings.""" 
+    global is_running, current_person_id, current_person_name, current_category_id
     try:
         # snapshot the user before wiping globals
         uid_snapshot = current_person_id
         uname_snapshot = current_person_name
+        cat_snapshot = current_category_id
 
         stop_event.set()
 
@@ -1185,8 +1236,8 @@ def stop_extraction(reason: str = "user") -> dict:
                 init_models()
             # spawn a detached worker to compute & store embeddings for the just-stopped user
             threading.Thread(
-                target=_extract_worker,
-                args=(int(uid_snapshot), uname_snapshot or "unknown"),
+                target=_extract_worker, 
+                args=(int(uid_snapshot), uname_snapshot or "unknown", cat_snapshot),
                 name=f"auto-extract-{uid_snapshot}",
                 daemon=True,
             ).start()
@@ -1197,6 +1248,7 @@ def stop_extraction(reason: str = "user") -> dict:
     finally:
         current_person_id = None
         current_person_name = None
+        current_category_id = None
 
 def remove_embeddings(id: int):
     """Remove stored embeddings (body + face)."""
@@ -1208,6 +1260,7 @@ def remove_embeddings(id: int):
             return {"status": "error", "message": f"user id {id} not found" }
         user.body_embedding = None
         user.face_embedding = None
+        user.category_id = None
         user.last_embedding_update_ts = datetime.now(timezone.utc)
         session.commit()
         logger.warning("Embeddings removed for user id=%d", id)
