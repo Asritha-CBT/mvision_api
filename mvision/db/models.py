@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Enum, Interval, ForeignKey, event
+from sqlalchemy import Column, Integer, String, DateTime, Enum, Interval, ForeignKey, event, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from sqlalchemy.ext.declarative import declarative_base
@@ -12,11 +12,8 @@ class Camera(Base):
     __tablename__ = "cameras"
 
     id = Column(Integer, primary_key=True, index=True)
-    camera_name = Column(String, nullable=False)
-    camera_number = Column(String, unique=True, nullable=False)
-
-    category_id = Column(Integer, ForeignKey("camera_category.id"), nullable=False)
-
+    camera_name = Column(String, nullable=False) 
+    category_id = Column(Integer, ForeignKey("camera_category.id"), nullable=False) 
     category = relationship("CameraCategory", back_populates="cameras")
 
 class CameraCategory(Base):
@@ -42,6 +39,9 @@ class User(Base):
     category_id = Column(Integer, ForeignKey("camera_category.id"), nullable=True)
     category = relationship("CameraCategory", back_populates="users")
     status = Column(String, default="active")
+    __table_args__ = (
+        UniqueConstraint("name", "department", name="uq_user_name_department"),
+    )
 
 class UserPresence(Base):
     __tablename__ = "user_presence"
@@ -49,7 +49,7 @@ class UserPresence(Base):
     id = Column(Integer, primary_key=True, index=True)
 
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    cam_number = Column(String, nullable=False)
+    camera_id = Column(Integer, ForeignKey("cameras.id"), nullable=False)
 
     entry_time = Column(
         DateTime(timezone=True),
@@ -63,4 +63,5 @@ class UserPresence(Base):
     )
 
     user = relationship("User", backref="presence_logs")
+    camera = relationship("Camera")
  
