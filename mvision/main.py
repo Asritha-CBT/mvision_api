@@ -2,6 +2,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from mvision.routes.user_routes import router as user_router
 from mvision.routes.embeddings import router as embeddings_router
+from mvision.routes.camera_routes import router as camera_router
+from mvision.routes.category_routes import router as category_router
 from mvision.routes.reports import router as report_router
 from mvision.db.database import engine
 from mvision.db import models
@@ -17,7 +19,7 @@ app = FastAPI(title="My FastAPI App")
 # Enable CORS so frontend can talk to backend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],       # allow all (you can restrict later)
+    allow_origins=["*"],       # allow all (can restrict later)
     allow_credentials=True,
     allow_methods=["*"],       # GET, POST, OPTIONS, DELETE, etc.
     allow_headers=["*"],       # allow all headers
@@ -26,11 +28,9 @@ app.add_middleware(
 # Include your user router
 app.include_router(user_router, prefix="/users", tags=["Users"])
 app.include_router(embeddings_router)  
-app.include_router(
-    report_router,
-    prefix="/reports",
-    tags=["Reports"]
-)
+app.include_router(camera_router, prefix="/camera", tags=["Camera"])  
+app.include_router(category_router, prefix="/category", tags=["Category"])  
+app.include_router(report_router, prefix="/reports", tags=["Reports"])
 
 @app.get("/")
 def root():

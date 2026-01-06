@@ -12,7 +12,7 @@ class UserRegister(BaseModel):
             raise ValueError("cannot be empty")
         return value
 
-class CategoryResponse(BaseModel):
+class CameraCategoryResponse(BaseModel):
     id: int
     name: str
     description: Optional[str] = None
@@ -27,7 +27,7 @@ class UserResponse(BaseModel):
     body_embedding: Optional[List[float]] = None   # <-- pgvector field
     face_embedding: Optional[List[float]] = None   # <-- pgvector field
     category_id: Optional[int] = None
-    category: Optional[CategoryResponse] = None  # nested object
+    category: Optional[CameraCategoryResponse] = None  # nested object
 
     class Config:
         from_attributes = True
@@ -44,7 +44,7 @@ class EmbeddingUpdate(BaseModel):
 #user presence
 class UserPresenceBase(BaseModel):
     user_id: int
-    cam_number: str
+    camera_id: int
 
 
 class UserPresenceCreate(UserPresenceBase):
@@ -55,7 +55,6 @@ class UserPresenceResponse(BaseModel):
     id: int
     user_id: int
     user_name: str   
-    cam_number: str
     cam_name: str
     entry_time: datetime
     exit_time: datetime | None

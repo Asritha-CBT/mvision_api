@@ -3,16 +3,9 @@ from sqlalchemy.orm import Session
 from datetime import datetime 
 from mvision.db.database import get_db
 from mvision.services.presence_report import get_user_presence_report 
-from mvision.schemas import user_schema
-from mvision.constants import CAMERAS  
+from mvision.schemas import user_schema 
 
-router = APIRouter()
-@router.get("/cameras")
-def get_cameras():
-    """
-    Returns list of available cameras (hardcoded)
-    """
-    return CAMERAS
+router = APIRouter() 
 
 @router.get(
     "/user_presence",

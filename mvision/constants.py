@@ -18,7 +18,7 @@ EMB_CSV = os.getenv("EMB_CSV", "live_embeddings_multi.csv")
 CROPS_ROOT = os.getenv("CROPS_ROOT", "crops")
 EMB_DB_URL = os.getenv(
     "DATABASE_URL",
-    "postgresql://postgres:postgrey1234$$@192.168.1.7:5432/m_vision",
+    "postgresql://postgres:postgrey1234$$@localhost:5432/m_vision",
 )
 
 
@@ -26,11 +26,4 @@ EMB_DB_URL = os.getenv(
 
 
 # ensure crops dir exists by default
-Path(CROPS_ROOT).mkdir(parents=True, exist_ok=True)
-
-CAMERAS = [
-    {"id": "CAM_01", "name": "Entrance Camera"},
-    {"id": "CAM_02", "name": "Lobby Camera"},
-    {"id": "CAM_03", "name": "Parking Camera"},
-    {"id": "CAM_04", "name": "Office Floor Camera"},
-]
+Path(CROPS_ROOT).mkdir(parents=True, exist_ok=True) 
