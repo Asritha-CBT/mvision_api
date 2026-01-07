@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Enum, Interval, ForeignKey, event
+from sqlalchemy import Column, Integer, String, DateTime, Enum, Interval, ForeignKey, event, LargeBinary
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from sqlalchemy.ext.declarative import declarative_base
@@ -36,8 +36,15 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, nullable=False)
     department = Column(String, nullable=False) 
+    # Centroids (fast pgvector shortlist)
     body_embedding = Column(Vector(512), nullable=True)
     face_embedding = Column(Vector(512), nullable=True)
+
+    # Raw banks (stored as BYTEA in Postgres)
+    # Format: gzip(np.save(float32[N,512]))
+    body_embeddings_raw = Column(LargeBinary, nullable=True)
+    face_embeddings_raw = Column(LargeBinary, nullable=True)
+
     last_embedding_update_ts = Column(DateTime(timezone=True), nullable=True)
     category_id = Column(Integer, ForeignKey("camera_category.id"), nullable=False)
     category = relationship("CameraCategory", back_populates="users")
