@@ -1,7 +1,7 @@
 from pydantic import BaseModel, Field, field_validator
 from typing import Optional
 
-class CameraCategoryCreate(BaseModel):
+class AreaDefinitionCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=80)
     description: Optional[str] = None
 
@@ -11,7 +11,7 @@ class CameraCategoryCreate(BaseModel):
             raise ValueError("cannot be empty")
         return v.strip()
 
-class CameraCategoryUpdate(BaseModel):
+class AreaDefinitionUpdate(BaseModel):
     name: str = Field(..., min_length=1, max_length=80)
     description: Optional[str] = None
 
@@ -21,7 +21,7 @@ class CameraCategoryUpdate(BaseModel):
             raise ValueError("cannot be empty")
         return v.strip()
 
-class CameraCategoryResponse(BaseModel):
+class AreaDefinitionResponse(BaseModel):
     id: int
     name: str
     description: Optional[str] = None

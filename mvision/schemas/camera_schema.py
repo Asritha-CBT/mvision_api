@@ -1,8 +1,9 @@
 from pydantic import BaseModel, Field, field_validator
 from typing import Optional
+from pydantic.networks import IPvAnyAddress
 
-# Reuse same nested category structure style
-class CameraCategoryResponse(BaseModel):
+# Reuse same nested area_definition structure style
+class AreaDefinitionResponse(BaseModel):
     id: int
     name: str
     description: Optional[str] = None
@@ -13,7 +14,8 @@ class CameraCategoryResponse(BaseModel):
 
 class CameraCreate(BaseModel):
     camera_name: str = Field(..., min_length=1, max_length=80) 
-    category_id: int = Field(..., gt=0)
+    camera_ip: IPvAnyAddress 
+    area_definition_id: int = Field(..., gt=0)
 
     @field_validator("camera_name")
     def not_empty(cls, value: str):
@@ -25,8 +27,9 @@ class CameraCreate(BaseModel):
 class CameraResponse(BaseModel):
     id: int
     camera_name: str 
-    category_id: int
-    category: Optional[CameraCategoryResponse] = None  # joinedload(Camera.category)
+    camera_ip: IPvAnyAddress   
+    area_definition_id: int
+    area_definition: Optional[AreaDefinitionResponse] = None  # joinedload(Camera.area_definition)
 
     class Config:
         from_attributes = True

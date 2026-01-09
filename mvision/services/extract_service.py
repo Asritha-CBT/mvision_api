@@ -131,7 +131,7 @@ stop_event = threading.Event()
 is_running = False
 current_person_id: Optional[int] = None
 current_person_name: Optional[str] = None
-current_category_id: Optional[int] = None
+current_area_definition_id: Optional[int] = None
 
 # ---- extraction progress state (for /extract) ----
 progress_lock = threading.Lock()
@@ -959,7 +959,7 @@ def _compute_face_embedding_from_gallery(user_name: str,
 def _update_db_embeddings(user_id: int,
                           body_emb: Optional[np.ndarray],
                           face_emb: Optional[np.ndarray],
-                          category_id: Optional[int] = None) -> Dict[str, object]:
+                          area_definition_id: Optional[int] = None) -> Dict[str, object]:
     session = get_session()
     try:
         user = session.query(User).filter(User.id == user_id).first()
@@ -968,14 +968,14 @@ def _update_db_embeddings(user_id: int,
             return {"status": "error", "message": "user not found"}
 
         changed = False
-        if category_id is not None:
+        if area_definition_id is not None:
             try:
-                cid = int(category_id)
-                if getattr(user, "category_id", None) != cid:
-                    user.category_id = cid
+                cid = int(area_definition_id)
+                if getattr(user, "area_definition_id", None) != cid:
+                    user.area_definition_id = cid
                     changed = True
             except Exception:
-                logger.warning("Invalid category_id=%r for user_id=%s (skipping).", category_id, user_id)
+                logger.warning("Invalid area_definition_id=%r for user_id=%s (skipping).", area_definition_id, user_id)
         if body_emb is not None:
             user.body_embedding = body_emb.tolist()  # pgvector expects list
             changed = True
@@ -985,9 +985,9 @@ def _update_db_embeddings(user_id: int,
         if changed:
             user.last_embedding_update_ts = datetime.now(timezone.utc)
             session.commit()
-            logger.info("DB updated: user=%s category_id=%s body=%s face=%s",
-                                    user_id, getattr(user, "category_id", None), body_emb is not None, face_emb is not None)
-            return {"status": "ok", "body": body_emb is not None, "face": face_emb is not None,"category_id": getattr(user, "category_id", None),}
+            logger.info("DB updated: user=%s area_definition_id=%s body=%s face=%s",
+                                    user_id, getattr(user, "area_definition_id", None), body_emb is not None, face_emb is not None)
+            return {"status": "ok", "body": body_emb is not None, "face": face_emb is not None,"area_definition_id": getattr(user, "area_definition_id", None),}
         else:
             logger.info("No embeddings to update for user=%s", user_id)
             return {"status": "no_embeddings"}
@@ -999,7 +999,7 @@ def _update_db_embeddings(user_id: int,
         session.close()
 
 # ---- Background extraction worker (runs on POST /extract) ----
-def _extract_worker(user_id: int, user_name: str, category_id: Optional[int] = None):
+def _extract_worker(user_id: int, user_name: str, area_definition_id: Optional[int] = None):
     try:
         _progress_reset(user_id, user_name)
         _progress_set(user_id, stage="scanning", message="Counting images...")
@@ -1052,11 +1052,11 @@ def _extract_worker(user_id: int, user_name: str, category_id: Optional[int] = N
         # NEW: show DB commit stage BEFORE the commit happens
         _progress_set(user_id, stage="db_commit", percent=95, message="Saving to DB...")
 
-        res = _update_db_embeddings(user_id, body_emb, face_emb, category_id=category_id)
+        res = _update_db_embeddings(user_id, body_emb, face_emb, area_definition_id=area_definition_id)
 
         status = str(res.get("status", "unknown"))
         if status == "ok":
-            _progress_set(user_id, stage="done", message="Embeddings + category saved", percent=100)
+            _progress_set(user_id, stage="done", message="Embeddings + area_definition saved", percent=100)
         else:
             # use error stage so UI can show failure
             _progress_set(user_id, stage="error", message=f"DB update failed: {status}", percent=0)
@@ -1079,7 +1079,7 @@ def ensure_models():
             return
         init_models()
 
-def extract_embeddings_async(user_id: int, category_id: Optional[int] = None) -> Dict[str, object]:
+def extract_embeddings_async(user_id: int, area_definition_id: Optional[int] = None) -> Dict[str, object]:
     """Kick off background extraction from saved galleries with progress reporting."""
     ensure_models()
 
@@ -1087,7 +1087,7 @@ def extract_embeddings_async(user_id: int, category_id: Optional[int] = None) ->
     with _RUNNING_LOCK:
         if user_id in _RUNNING:
             st = get_progress_for_user(user_id) or {}
-            return {"status": "started", "id": user_id, "name": st.get("name", ""), "category_id": category_id}
+            return {"status": "started", "id": user_id, "name": st.get("name", ""), "area_definition_id": area_definition_id}
 
         _RUNNING.add(user_id)
 
@@ -1100,7 +1100,7 @@ def extract_embeddings_async(user_id: int, category_id: Optional[int] = None) ->
             return {"status": "error", "message": f"user id {user_id} not found"}
 
         user_name = user.name
-        cat_id = int(category_id) if category_id is not None else getattr(user, "category_id", None)
+        area_def_id = int(area_definition_id) if area_definition_id is not None else getattr(user, "area_definition_id", None)
 
     except Exception:
         session.rollback()
@@ -1115,7 +1115,7 @@ def extract_embeddings_async(user_id: int, category_id: Optional[int] = None) ->
 
     def _run():
         try:
-            _extract_worker(user_id, user_name, cat_id)
+            _extract_worker(user_id, user_name, area_def_id)
         finally:
             with _RUNNING_LOCK:
                 _RUNNING.discard(user_id)
@@ -1123,12 +1123,12 @@ def extract_embeddings_async(user_id: int, category_id: Optional[int] = None) ->
     t = threading.Thread(target=_run, daemon=True, name=f"extract-{user_id}")
     t.start()
 
-    return {"status": "started", "id": user_id, "name": user_name, "category_id": cat_id}
+    return {"status": "started", "id": user_id, "name": user_name, "area_definition_id": area_def_id}
  
 # ------------------ control API ------------------
-def start_extraction(user_id: int, show_viewer: bool = True, category_id: Optional[int] = None) -> dict:
+def start_extraction(user_id: int, show_viewer: bool = True, area_definition_id: Optional[int] = None) -> dict:
     """Start capture+crop across all RTSP streams for the given user_id."""
-    global is_running, current_person_id, current_person_name, current_category_id
+    global is_running, current_person_id, current_person_name, current_area_definition_id
     global viewer_thread
 
     if is_running:
@@ -1141,14 +1141,14 @@ def start_extraction(user_id: int, show_viewer: bool = True, category_id: Option
         if not user:
             return {"status": "error", "message": f"user id {user_id} not found"}
         user_name = str(user.name)
-        # NEW: store requested category_id (optional)
-        if category_id is not None:
+        # NEW: store requested area_definition_id (optional)
+        if area_definition_id is not None:
             try:
-                user.category_id = int(category_id)
+                user.area_definition_id = int(area_definition_id)
                 session.commit()
             except Exception:
                 session.rollback()
-                logger.exception("Failed updating category_id for user_id=%s", user_id)
+                logger.exception("Failed updating area_definition_id for user_id=%s", user_id)
     except Exception:
         session.rollback()
         logger.exception("DB error during user lookup (start_extraction).")
@@ -1170,7 +1170,7 @@ def start_extraction(user_id: int, show_viewer: bool = True, category_id: Option
 
     current_person_id = int(user_id)
     current_person_name = user_name
-    current_category_id = int(category_id) if category_id is not None else getattr(user, "category_id", None)
+    current_area_definition_id = int(area_definition_id) if area_definition_id is not None else getattr(user, "area_definition_id", None)
 
     start_workers_if_needed()
 
@@ -1199,12 +1199,12 @@ def start_extraction(user_id: int, show_viewer: bool = True, category_id: Option
 
 def stop_extraction(reason: str = "user") -> dict:
     """Gracefully stop all threads and reset state. Then auto-extract & store embeddings.""" 
-    global is_running, current_person_id, current_person_name, current_category_id
+    global is_running, current_person_id, current_person_name, current_area_definition_id
     try:
         # snapshot the user before wiping globals
         uid_snapshot = current_person_id
         uname_snapshot = current_person_name
-        cat_snapshot = current_category_id
+        cat_snapshot = current_area_definition_id
 
         stop_event.set()
 
@@ -1248,7 +1248,7 @@ def stop_extraction(reason: str = "user") -> dict:
     finally:
         current_person_id = None
         current_person_name = None
-        current_category_id = None
+        current_area_definition_id = None
 
 def remove_embeddings(id: int):
     """Remove stored embeddings (body + face)."""
@@ -1260,7 +1260,7 @@ def remove_embeddings(id: int):
             return {"status": "error", "message": f"user id {id} not found" }
         user.body_embedding = None
         user.face_embedding = None
-        user.category_id = None
+        user.area_definition_id = None
         user.last_embedding_update_ts = datetime.now(timezone.utc)
         session.commit()
         logger.warning("Embeddings removed for user id=%d", id)

@@ -1,18 +1,29 @@
 from pydantic import BaseModel, Field, field_validator
-from typing import List, Optional
-from datetime import datetime, timedelta 
+from typing import List, Optional, Literal
+from datetime import datetime, timedelta  
 
-class UserRegister(BaseModel):
+
+class DepartmentResponse(BaseModel):
+    id: int
+    name: str
+    status: str
+
+    class Config:
+        from_attributes = True
+
+class UserRegister(BaseModel): 
     name: str = Field(..., min_length=1, max_length=50)
-    department: str = Field(..., min_length=1, max_length=50)
+    gender: Literal["male", "female", "other"]
+    department_id: int
 
-    @field_validator('name', 'department')
-    def not_empty(cls, value):
+    @field_validator("name")
+    @classmethod
+    def not_empty(cls, value: str):
         if not value.strip():
-            raise ValueError("cannot be empty")
+            raise ValueError("Name cannot be empty")
         return value
 
-class CameraCategoryResponse(BaseModel):
+class AreaDefinitionResponse(BaseModel):
     id: int
     name: str
     description: Optional[str] = None
@@ -23,11 +34,12 @@ class CameraCategoryResponse(BaseModel):
 class UserResponse(BaseModel):
     id: int
     name: str
-    department: Optional[str] = None
+    department: DepartmentResponse | None = None 
+    gender: Optional[str] = None 
     body_embedding: Optional[List[float]] = None   # <-- pgvector field
     face_embedding: Optional[List[float]] = None   # <-- pgvector field
-    category_id: Optional[int] = None
-    category: Optional[CameraCategoryResponse] = None  # nested object
+    area_definition_id: Optional[int] = None
+    area_definition: Optional[AreaDefinitionResponse] = None  # nested object
 
     class Config:
         from_attributes = True

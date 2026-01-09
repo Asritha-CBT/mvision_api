@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from mvision.routes.user_routes import router as user_router
 from mvision.routes.embeddings import router as embeddings_router
 from mvision.routes.camera_routes import router as camera_router
-from mvision.routes.category_routes import router as category_router
+from mvision.routes.area_definition_routes import router as area_definition_router
 from mvision.routes.reports import router as report_router
 from mvision.db.database import engine
 from mvision.db import models
@@ -29,7 +29,7 @@ app.add_middleware(
 app.include_router(user_router, prefix="/users", tags=["Users"])
 app.include_router(embeddings_router)  
 app.include_router(camera_router, prefix="/camera", tags=["Camera"])  
-app.include_router(category_router, prefix="/category", tags=["Category"])  
+app.include_router(area_definition_router, prefix="/area_definition", tags=["AreaDefinition"])  
 app.include_router(report_router, prefix="/reports", tags=["Reports"])
 
 @app.get("/")
