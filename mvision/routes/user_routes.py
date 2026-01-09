@@ -8,27 +8,46 @@ from mvision.db import models
 from datetime import datetime
 
 
-router = APIRouter()
+router = APIRouter() 
+
+# ---------------- GET ALL DEPARTMENTS ---------------- 
+@router.get("/departments", response_model=list[user_schema.DepartmentResponse])
+def get_all_departments(db: Session = Depends(get_db)):
+    departments = (
+        db.query(models.Department)
+        .order_by(func.lower(models.Department.name).asc())
+        .all()
+    )
+    return departments
 
 
 # ---------------- GET ALL USERS ----------------
 @router.get("/users", response_model=list[user_schema.UserResponse])
 def get_all_users(db: Session = Depends(get_db)):
-    users = (db.query(models.User).options(joinedload(models.User.category)).order_by(func.lower(models.User.name).asc()).all()) 
+    users = (
+        db.query(models.User)
+        .options(
+            joinedload(models.User.department),
+            joinedload(models.User.area_definition)
+        )
+        .order_by(func.lower(models.User.name).asc())
+        .all()
+    )
+    # print("------This is user data-------",users)
     return users
-
 
 # ---------------- CREATE USER ----------------
 @router.post("/user_register", response_model=user_schema.UserResponse)
 def user_register(user: user_schema.UserRegister, db: Session = Depends(get_db)):
     name = user.name.strip()
-    department = user.department.strip()
+    gender = user.gender.strip()
+    department_id = user.department_id
 
     exists = (
         db.query(models.User)
         .filter(
             models.User.name == name,
-            models.User.department == department
+            models.User.department_id == department_id
         )
         .first()
     )
@@ -41,13 +60,15 @@ def user_register(user: user_schema.UserRegister, db: Session = Depends(get_db))
 
     new_user = models.User(
         name=name,
-        department=department
+        gender=gender,
+        department_id=department_id 
     )
 
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
     return new_user
+
 
 
 # ---------------- UPDATE USER ----------------
@@ -59,14 +80,16 @@ def update_user(id: int, user: user_schema.UserRegister, db: Session = Depends(g
         raise HTTPException(status_code=404, detail="User not found")
 
     name = user.name.strip()
-    department = user.department.strip()
+    gender = user.gender.strip()
+    department = user.department_id
 
     # Check duplicate EXCLUDING current user
     exists = (
         db.query(models.User)
         .filter(
             models.User.name == name,
-            models.User.department == department,
+            models.User.gender == gender,
+            models.User.department_id == department,
             models.User.id != id
         )
         .first()
@@ -79,6 +102,7 @@ def update_user(id: int, user: user_schema.UserRegister, db: Session = Depends(g
         )
 
     db_user.name = name
+    db_user.gender = gender
     db_user.department = department
 
     try:

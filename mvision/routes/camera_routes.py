@@ -10,7 +10,7 @@ router = APIRouter()
 # ---------------- GET ALL CAMERAS ----------------
 @router.get("/cameras", response_model=list[camera_schema.CameraResponse])
 def get_all_cameras(db: Session = Depends(get_db)):
-    cams = db.query(models.Camera).options(joinedload(models.Camera.category)).order_by(func.lower(models.Camera.camera_name).asc()).all()
+    cams = db.query(models.Camera).options(joinedload(models.Camera.area_definition)).order_by(func.lower(models.Camera.camera_name).asc()).all()
     return cams
 # ---------------- GET ALL CAMERAS ----------------
 @router.get("/camera_list", response_model=list[camera_schema.CameraListResponse])
@@ -26,14 +26,14 @@ def camera_register(cam: camera_schema.CameraCreate, db: Session = Depends(get_d
     if exists:
         raise HTTPException(status_code=400, detail="Camera number already exists")
 
-    # ensure category exists
-    cat = db.query(models.CameraCategory).filter(models.CameraCategory.id == cam.category_id).first()
+    # ensure area_definition exists
+    cat = db.query(models.AreaDefinition).filter(models.AreaDefinition.id == cam.area_definition_id).first()
     if not cat:
-        raise HTTPException(status_code=400, detail="Invalid category_id")
+        raise HTTPException(status_code=400, detail="Invalid area_definition_id")
 
     new_cam = models.Camera(
         camera_name=cam.camera_name.strip(), 
-        category_id=cam.category_id
+        area_definition_id=cam.area_definition_id
     )
     db.add(new_cam)
     db.commit()
@@ -53,13 +53,13 @@ def update_camera(id: int, cam: camera_schema.CameraCreate, db: Session = Depend
         if exists:
             raise HTTPException(status_code=400, detail="Camera name already exists")
 
-    # ensure category exists
-    cat = db.query(models.CameraCategory).filter(models.CameraCategory.id == cam.category_id).first()
+    # ensure area_definition exists
+    cat = db.query(models.AreaDefinition).filter(models.AreaDefinition.id == cam.area_definition_id).first()
     if not cat:
-        raise HTTPException(status_code=400, detail="Invalid category_id")
+        raise HTTPException(status_code=400, detail="Invalid area_definition_id")
 
     db_cam.camera_name = cam.camera_name.strip() 
-    db_cam.category_id = cam.category_id
+    db_cam.area_definition_id = cam.area_definition_id
 
     db.commit()
     db.refresh(db_cam)
@@ -68,7 +68,7 @@ def update_camera(id: int, cam: camera_schema.CameraCreate, db: Session = Depend
 # ---------------- DELETE CAMERA ----------------
 @router.delete("/delete/{id}")
 def delete_camera(id: int, db: Session = Depends(get_db)):
-    # 1️⃣ Fetch camera
+    # Fetch camera
     db_cam = db.query(models.Camera).filter(
         models.Camera.id == id
     ).first()
@@ -76,18 +76,18 @@ def delete_camera(id: int, db: Session = Depends(get_db)):
     if not db_cam:
         raise HTTPException(status_code=404, detail="Camera not found")
 
-    # 2️⃣ Check if camera's category is used by any user
-    category_in_use_by_user = db.query(models.User).filter(
-        models.User.category_id == db_cam.category_id
+    # Check if camera's area_definition is used by any user
+    area_definition_in_use_by_user = db.query(models.User).filter(
+        models.User.area_definition_id == db_cam.area_definition_id
     ).first()
 
-    if category_in_use_by_user:
+    if area_definition_in_use_by_user:
         raise HTTPException(
             status_code=400,
             detail="Cannot delete, Camera is in use by users."
         )
 
-    # 3️⃣ Safe delete
+    # Safe delete
     db.delete(db_cam)
     db.commit()
 
